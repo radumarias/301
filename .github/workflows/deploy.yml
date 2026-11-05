@@ -40,6 +40,7 @@ jobs:
       ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
       ADMIN_SERVICE_TOKENS: ${{ vars.ADMIN_SERVICE_TOKENS }}
       ACCESS_TEAM_DOMAIN: ${{ vars.ACCESS_TEAM_DOMAIN }}
+      DOMAIN: ${{ vars.DOMAIN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,7 +61,7 @@ jobs:
       - name: Smoke test
         run: |
           sleep 10
-          code=$(curl -s -o /dev/null -w '%{http_code}' https://301.xorio.rs/robots.txt)
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://$DOMAIN/robots.txt)
           echo "robots.txt -> $code"; test "$code" = 200
-          code=$(curl -s -o /dev/null -w '%{http_code}' https://301.xorio.rs/api/me)
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://$DOMAIN/api/me)
           echo "/api/me without login -> $code (expect 302/401/403 from Access)"; test "$code" != 200
