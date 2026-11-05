@@ -22,7 +22,7 @@ pub fn serve(path: &str) -> Result<Response> {
     h.set("Referrer-Policy", "same-origin")?;
     h.set(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
+        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
     )?;
     Ok(res)
 }
