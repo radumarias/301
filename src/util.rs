@@ -40,7 +40,7 @@ pub fn parse_date_str(s: &str) -> Option<i64> {
         let b = s.as_bytes();
         let fixed = if s.len() > 5
             && matches!(b[s.len() - 5], b'+' | b'-')
-            && !s[s.len() - 4..].contains(':')
+            && b[s.len() - 4..].iter().all(u8::is_ascii_digit)
         {
             format!("{}:{}", &s[..s.len() - 2], &s[s.len() - 2..])
         } else {
@@ -78,10 +78,24 @@ pub fn json_error(msg: impl Into<String>, status: u16) -> Result<Response> {
     json(&serde_json::json!({ "error": msg.into() }), status)
 }
 
-/// Builds a redirect without going through `url::Url` (keeps the URL exactly as stored).
+/// Percent-encodes non-ASCII and control characters so the value is a valid header
+/// (`Headers.set` rejects non-ByteString values). ASCII is left exactly as stored.
+pub fn header_safe_url(location: &str) -> String {
+    // Controls, non-ASCII and the characters WHATWG URL parsing would encode in a path.
+    const UNSAFE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'<')
+        .add(b'>')
+        .add(b'`');
+    percent_encoding::utf8_percent_encode(location, UNSAFE).to_string()
+}
+
+/// Builds a redirect without going through `url::Url` (keeps the URL as stored, apart
+/// from percent-encoding non-ASCII characters).
 pub fn redirect(location: &str, status: u16) -> Result<Response> {
     let headers = Headers::new();
-    headers.set("Location", location)?;
+    headers.set("Location", &header_safe_url(location))?;
     headers.set("Cache-Control", "private, max-age=0")?;
     headers.set("Referrer-Policy", "unsafe-url")?;
     headers.set("X-Robots-Tag", "noindex")?;
@@ -126,6 +140,19 @@ mod tests {
         assert_eq!(
             esc("<a href=\"x\">&'"),
             "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
+        );
+    }
+
+    #[test]
+    fn location_is_header_safe() {
+        assert_eq!(
+            header_safe_url("https://e.com/a?b=1"),
+            "https://e.com/a?b=1"
+        );
+        assert_eq!(header_safe_url("https://e.com/ü"), "https://e.com/%C3%BC");
+        assert_eq!(
+            header_safe_url("https://e.com/a b\"c"),
+            "https://e.com/a%20b%22c"
         );
     }
 

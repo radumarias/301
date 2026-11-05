@@ -427,9 +427,9 @@ async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
 }
 
 pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
-    if req.rows.len() > 500 {
+    if req.rows.len() > 100 {
         return Err(StoreError::Bad(
-            "at most 500 rows per commit; send them in chunks".into(),
+            "at most 100 rows per commit; send them in chunks".into(),
         ));
     }
     if !["skip", "overwrite", "rename"].contains(&req.on_conflict.as_str()) {
@@ -444,7 +444,17 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
         .iter()
         .map(|r| r.slug.as_deref().and_then(slug::normalize))
         .collect();
-    let existing = taken(env, &slugs.iter().flatten().cloned().collect::<Vec<_>>()).await?;
+    // Candidates for rows without a slug, checked in the same batched lookup instead of
+    // one D1 query per row (which runs into the per-invocation query limit).
+    let generated: Vec<Option<String>> = slugs
+        .iter()
+        .map(|s| {
+            s.is_none()
+                .then(|| slug::generate(st.slug_style(), st.default_slug_length, 0))
+        })
+        .collect();
+    let lookup: Vec<String> = slugs.iter().chain(&generated).flatten().cloned().collect();
+    let existing = taken(env, &lookup).await?;
     let mut seen: HashSet<String> = HashSet::new();
     let d = store::db(env)?;
     let mut stmts = vec![];
@@ -466,7 +476,23 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                     continue;
                 }
             },
-            None => store::unique_slug(env, st.slug_style(), st.default_slug_length).await?,
+            None => {
+                // A generated slug that collides is regenerated, never skipped or renamed.
+                let mut c = generated[i].clone().unwrap_or_default();
+                let mut tries = 0;
+                while c.is_empty() || existing.contains_key(&c) || seen.contains(&c) {
+                    tries += 1;
+                    if tries > 5 {
+                        break;
+                    }
+                    c = store::unique_slug(env, st.slug_style(), st.default_slug_length).await?;
+                }
+                if tries > 5 {
+                    fail(None, "could not find a free slug, try again".into());
+                    continue;
+                }
+                c
+            }
         };
         let conflict = existing.get(&slug_v).copied();
         let dup = seen.contains(&slug_v);
@@ -532,12 +558,14 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
         result.created += 1;
     }
 
-    for chunk in stmts.chunks(50) {
-        d.batch(chunk.to_vec()).await?;
+    // One batch (one transaction): on failure nothing is written, so the reported counts
+    // never disagree with the database and the client can retry the chunk as-is.
+    if !stmts.is_empty() {
+        d.batch(stmts).await?;
     }
     // New links get their KV record on first click; overwritten ones are refreshed now.
-    for link in &overwritten {
-        store::sync_kv(env, link).await?;
+    for r in join_all(overwritten.iter().map(|l| store::sync_kv(env, l))).await {
+        r?;
     }
     Ok(result)
 }

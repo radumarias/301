@@ -48,7 +48,9 @@ pub fn gone(reason: &str) -> Result<Response> {
     )
 }
 
-pub fn password(slug: &str, failed: bool) -> Result<Response> {
+/// `query` is the visitor's query string, kept on the form action so passthrough
+/// parameters and the `qr` marker survive the POST.
+pub fn password(slug: &str, query: Option<&str>, failed: bool) -> Result<Response> {
     let err = if failed {
         "<p class=err>Wrong password, try again.</p>"
     } else {
@@ -59,9 +61,13 @@ pub fn password(slug: &str, failed: bool) -> Result<Response> {
         "Password required",
         &format!(
             "<h1>Password required</h1><p>The link <b>/{s}</b> is protected.</p>\
-             <form method=post action=\"/{s}\"><input type=password name=password autofocus required autocomplete=off placeholder=Password>\
+             <form method=post action=\"/{s}{q}\"><input type=password name=password autofocus required autocomplete=off placeholder=Password>\
              {err}<button type=submit>Continue</button></form>",
-            s = esc(slug)
+            s = esc(slug),
+            q = query
+                .filter(|q| !q.is_empty())
+                .map(|q| format!("?{}", esc(q)))
+                .unwrap_or_default()
         ),
     )
 }

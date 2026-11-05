@@ -74,16 +74,17 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         };
     }
 
+    let url = req.url()?;
     if let Some(hash) = &rec.pw {
         if req.method() != Method::Post {
-            return pages::password(&slug, false);
+            return pages::password(&slug, url.query(), false);
         }
         let form = req.form_data().await.ok();
         let given = form
             .and_then(|f| f.get_field("password"))
             .unwrap_or_default();
-        if !crate::crypto::verify_password(&given, hash).await {
-            return pages::password(&slug, true);
+        if !crate::crypto::verify_password(given.trim(), hash).await {
+            return pages::password(&slug, url.query(), true);
         }
     }
 
@@ -98,7 +99,6 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
     let country = cf.and_then(|c| c.country());
     let city = cf.and_then(|c| c.city());
 
-    let url = req.url()?;
     let dest = rec.destination(info.os, info.device, country.as_deref());
     let dest = if rec.passthrough {
         passthrough_query(dest, url.query())

@@ -624,10 +624,11 @@ async function importPage() {
       const chosen = rows.filter((_, i) => keep[i] !== false && rows[i].url);
       const total = { created: 0, updated: 0, skipped: 0, errors: [], renamed: [] };
       try {
-        for (let i = 0; i < chosen.length; i += 200) {
-          status.textContent = `Importing ${Math.min(i + 200, chosen.length)} of ${chosen.length}…`;
+        const CHUNK = 25; // stays under Workers Free's 50 D1 queries per request
+        for (let i = 0; i < chosen.length; i += CHUNK) {
+          status.textContent = `Importing ${Math.min(i + CHUNK, chosen.length)} of ${chosen.length}…`;
           progress.firstChild.style.width = ((i / chosen.length) * 100).toFixed(0) + "%";
-          const r = await api("POST", "/import/commit", { rows: chosen.slice(i, i + 200), on_conflict: conflict.value, tags: extraTag.value.trim() ? [extraTag.value.trim()] : [] });
+          const r = await api("POST", "/import/commit", { rows: chosen.slice(i, i + CHUNK), on_conflict: conflict.value, tags: extraTag.value.trim() ? [extraTag.value.trim()] : [] });
           total.created += r.created; total.updated += r.updated; total.skipped += r.skipped;
           total.errors.push(...r.errors); total.renamed.push(...r.renamed);
         }

@@ -320,13 +320,14 @@ async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
     if body.ids.is_empty() {
         return json(&serde_json::json!({ "done": 0, "errors": [] }), 200);
     }
-    let marks = vec!["?"; body.ids.len()].join(",");
-    let ids: Vec<JsValue> = body.ids.iter().map(|id| n(*id)).collect();
-    let links = store::with_aliases(
-        env,
-        store::query_links(env, &format!("WHERE id IN ({marks})"), &ids).await?,
-    )
-    .await?;
+    // D1 allows at most 100 bound parameters per statement.
+    let mut links = vec![];
+    for chunk in body.ids.chunks(90) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let ids: Vec<JsValue> = chunk.iter().map(|id| n(*id)).collect();
+        links.extend(store::query_links(env, &format!("WHERE id IN ({marks})"), &ids).await?);
+    }
+    let links = store::with_aliases(env, links).await?;
 
     let Some(input) = input else {
         return respond(
@@ -500,8 +501,10 @@ async fn export(env: &Env, format: &str) -> Result<Response> {
     } else {
         let mut csv = String::from("slug,url,title,tags,notes,redirect_type,disabled,expires_at,clicks,created_at,source,aliases\n");
         for l in &links {
+            // Slugs/aliases are validated to [A-Za-z0-9-_./]: written raw so a leading '-'
+            // is not prefixed with "'" (which would break re-importing the export).
             let row = [
-                csv_field(&l.slug),
+                l.slug.clone(),
                 csv_field(&l.url),
                 csv_field(l.title.as_deref().unwrap_or("")),
                 csv_field(&l.tags.join(";")),
@@ -512,7 +515,7 @@ async fn export(env: &Env, format: &str) -> Result<Response> {
                 l.clicks.to_string(),
                 iso(l.created_at),
                 csv_field(&l.source),
-                csv_field(&l.aliases.join(";")),
+                l.aliases.join(";"),
             ];
             csv.push_str(&row.join(","));
             csv.push('\n');

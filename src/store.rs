@@ -156,11 +156,16 @@ pub async fn settings_cached(env: &Env) -> Settings {
     {
         return st;
     }
-    let st = settings(env).await.unwrap_or_default();
-    if let Ok(put) = store.put("cfg", serde_json::to_string(&st).unwrap_or_default()) {
-        let _ = put.execute().await;
+    match settings(env).await {
+        Ok(st) => {
+            if let Ok(put) = store.put("cfg", serde_json::to_string(&st).unwrap_or_default()) {
+                let _ = put.execute().await;
+            }
+            st
+        }
+        // Do not cache defaults on a D1 error: they would stick until settings are re-saved.
+        Err(_) => Settings::default(),
     }
-    st
 }
 
 pub async fn settings(env: &Env) -> worker::Result<Settings> {
@@ -290,6 +295,7 @@ pub async fn claim_slug(env: &Env, requested: &str, owner: Option<i64>) -> SResu
 async fn apply_password(link: &mut Link, input: &LinkInput) -> SResult<()> {
     if let Some(p) = &input.password {
         match p.as_deref().map(str::trim) {
+            // Trimmed here and in the redirect path's check, so both sides agree.
             Some(pw) if !pw.is_empty() => {
                 if pw.len() > 256 {
                     return Err(StoreError::Bad(
@@ -527,9 +533,17 @@ pub async fn lookup(env: &Env, slug: &str) -> worker::Result<Option<(KvRecord, b
         .map(|l| (KvRecord::from_link(&l), true)))
 }
 
+/// Read-through fills expire: a fill racing an admin update/delete would otherwise write
+/// a stale record (or resurrect a deleted link) in KV permanently.
+pub const KV_FILL_TTL: u64 = 3600;
+
 pub async fn fill_kv(env: &Env, slug: &str, rec: &KvRecord) -> SResult<()> {
     let json = serde_json::to_string(rec).unwrap_or_default();
-    kv(env)?.put(&kv_key(slug), json)?.execute().await?;
+    kv(env)?
+        .put(&kv_key(slug), json)?
+        .expiration_ttl(KV_FILL_TTL)
+        .execute()
+        .await?;
     Ok(())
 }
 
