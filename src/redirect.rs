@@ -35,7 +35,7 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
             return Response::ok("User-agent: *\nDisallow: /_/\nDisallow: /api/\n");
         }
         "favicon.ico" | "favicon.svg" => {
-            let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#e8590c"/><text x="32" y="42" font-family="monospace" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">301</text></svg>"##;
+            let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#1d5fa8"/><text x="32" y="42" font-family="monospace" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">301</text></svg>"##;
             let mut res = Response::ok(svg)?;
             res.headers_mut().set("Content-Type", "image/svg+xml")?;
             res.headers_mut()

@@ -4,16 +4,16 @@ use crate::util::esc;
 use worker::{Response, Result};
 
 const STYLE: &str = r#"
-:root{--bg:#f7f7f5;--fg:#1d1d1b;--muted:#6b6b66;--card:#fff;--line:#e4e4df;--accent:#e8590c}
-@media (prefers-color-scheme:dark){:root{--bg:#141413;--fg:#ececea;--muted:#9a9a94;--card:#1f1f1d;--line:#33332f;--accent:#ff8a3d}}
+:root{--bg:#f5f6f4;--fg:#161a18;--muted:#59625d;--card:#fff;--line:#d4d9d5;--accent:#1d5fa8;--ink:#fff;--bad:#b4233c}
+@media (prefers-color-scheme:dark){:root{--bg:#101312;--fg:#e3e7e4;--muted:#9aa49e;--card:#171b19;--line:#2c3330;--accent:#7db3ee;--ink:#101312;--bad:#f08a95}}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);
-font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;padding:16px}
-main{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px;max-width:440px;width:100%}
-h1{font-size:20px;margin:0 0 8px}p{color:var(--muted);margin:0 0 16px;word-break:break-word}
-.code{font:600 44px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--accent);margin-bottom:12px}
-input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--fg);font-size:16px}
-button,a.btn{display:inline-block;margin-top:12px;padding:10px 16px;border:0;border-radius:9px;background:var(--accent);color:#fff;font-weight:600;font-size:15px;text-decoration:none;cursor:pointer}
-.err{color:#d9480f;margin:10px 0 0}small{color:var(--muted)}
+font:16px/1.55 "IBM Plex Sans","Segoe UI",system-ui,-apple-system,sans-serif;padding:16px}
+main{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 14px 34px -26px rgba(0,0,0,.45);padding:28px;max-width:440px;width:100%}
+h1{font:800 22px/1.15 "Schibsted Grotesk","Helvetica Neue",Arial,sans-serif;letter-spacing:-.01em;margin:0 0 8px}p{color:var(--muted);margin:0 0 16px;word-break:break-word}
+.code{font:800 44px/1 "Schibsted Grotesk","Helvetica Neue",Arial,sans-serif;color:var(--accent);margin-bottom:12px}
+input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font-size:16px}
+button,a.btn{display:inline-block;margin-top:12px;padding:10px 16px;border:0;border-radius:8px;background:var(--accent);color:var(--ink);font-weight:600;font-size:15px;text-decoration:none;cursor:pointer}
+input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}.err{color:var(--bad);margin:10px 0 0}small{color:var(--muted)}
 "#;
 
 pub fn page(status: u16, title: &str, body: &str) -> Result<Response> {
