@@ -4,17 +4,17 @@
 #
 #   - Workers KV namespace  xorio-301-links
 #   - D1 database           xorio-301
-#   - Access application    "301 admin" on 301.xorio.rs/_ and 301.xorio.rs/api,
+#   - Access application    "301 admin" on $DOMAIN/_ and $DOMAIN/api,
 #                           allowing only ADMIN_EMAILS
 #
 # Needs: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID. Optional: ADMIN_EMAILS (defaults
 # to the token owner's email), ACCESS_TEAM_DOMAIN (looked up when the token can read it),
-# DOMAIN (default 301.xorio.rs).
+# DOMAIN (default: the Worker's workers.dev host, xorio-301.<account subdomain>.workers.dev).
 set -euo pipefail
 
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
 : "${CLOUDFLARE_ACCOUNT_ID:?set CLOUDFLARE_ACCOUNT_ID}"
-DOMAIN="${DOMAIN:-301.xorio.rs}"
+WORKER_NAME="${WORKER_NAME:-xorio-301}"
 KV_TITLE="${KV_TITLE:-xorio-301-links}"
 D1_NAME="${D1_NAME:-xorio-301}"
 APP_NAME="${APP_NAME:-301 admin}"
@@ -70,6 +70,17 @@ if [[ -z "${ACCESS_TEAM_DOMAIN:-}" ]]; then
   exit 1
 fi
 echo "   $ACCESS_TEAM_DOMAIN"
+
+if [[ -z "${DOMAIN:-}" ]]; then
+  SUB=$(cf GET "$ACC/workers/subdomain" | jq -r '.result.subdomain // empty') || true
+  if [[ -z "$SUB" ]]; then
+    echo "No workers.dev subdomain on this account yet. Open Workers & Pages in the dashboard once to pick one." >&2
+    exit 1
+  fi
+  DOMAIN="$WORKER_NAME.$SUB.workers.dev"
+fi
+echo "== Host: $DOMAIN"
+[[ -n "${GITHUB_ENV:-}" ]] && echo "DOMAIN=$DOMAIN" >> "$GITHUB_ENV"
 
 echo "== Access application '$APP_NAME'"
 include=$(jq -nc --arg e "$ADMIN_EMAILS" '[$e | split(",")[] | gsub("^\\s+|\\s+$";"") | select(length>0) | {email:{email:.}}]')

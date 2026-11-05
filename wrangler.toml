@@ -1,8 +1,10 @@
 name = "xorio-301"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
-workers_dev = false
-routes = [{ pattern = "301.xorio.rs", custom_domain = true }]
+# Served on <name>.<account subdomain>.workers.dev. To move to a custom domain, set
+# workers_dev = false, add routes = [{ pattern = "301.xorio.rs", custom_domain = true }]
+# and the DOMAIN repo variable.
+workers_dev = true
 
 [build]
 command = "cargo install -q worker-build@^0.8 && worker-build --release"

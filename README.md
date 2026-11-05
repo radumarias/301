@@ -42,11 +42,11 @@ scripts/provision.sh   creates KV, D1 and the Access app idempotently
 
 1. In the Cloudflare dashboard, create an API token from the **Edit Cloudflare Workers** template and add:
    **Account → D1: Edit**, **Account → Access: Apps and Policies: Edit**,
-   **Account → Access: Organizations, Identity Providers, and Groups: Read**, **Zone (xorio.rs) → DNS: Edit**.
+   **Account → Access: Organizations, Identity Providers, and Groups: Read**, plus **Zone (xorio.rs) → DNS: Edit** only if you use a custom domain.
 2. In the GitHub repo, add **secrets** `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and optionally
    **variables** `ADMIN_EMAILS` (defaults to the token owner's email) and `ACCESS_TEAM_DOMAIN`.
 3. If you have never opened Zero Trust, visit [one.dash.cloudflare.com](https://one.dash.cloudflare.com) once to pick a team name.
-4. Push to `main`. The workflow tests, provisions KV / D1 / Access, applies migrations and deploys to the `301.xorio.rs` custom domain.
+4. Push to `main`. The workflow tests, provisions KV / D1 / Access, applies migrations and deploys to `xorio-301.<your-subdomain>.workers.dev` (set the `DOMAIN` variable and the route in `wrangler.toml` to use a custom domain such as 301.xorio.rs).
 
 ## Local development
 
