@@ -18,6 +18,54 @@ pub fn now_ms() -> i64 {
     }
 }
 
+/// ISO-8601 string for a unix-ms timestamp.
+pub fn iso(ms: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64))
+            .to_iso_string()
+            .into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ms.to_string()
+    }
+}
+
+/// Parses a date string (ISO-8601, RFC 2822, "+0000" offsets) to unix ms.
+pub fn parse_date_str(s: &str) -> Option<i64> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // JS accepts "+0000" offsets poorly; normalise to "+00:00".
+        let b = s.as_bytes();
+        let fixed = if s.len() > 5
+            && matches!(b[s.len() - 5], b'+' | b'-')
+            && !s[s.len() - 4..].contains(':')
+        {
+            format!("{}:{}", &s[..s.len() - 2], &s[s.len() - 2..])
+        } else {
+            s.to_string()
+        };
+        let t = js_sys::Date::parse(&fixed);
+        (!t.is_nan()).then_some(t as i64)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = s;
+        None
+    }
+}
+
+/// A plain response with a content type, no-store caching and nosniff.
+pub fn body(content: impl Into<String>, ctype: &str) -> Result<Response> {
+    let mut res = Response::ok(content)?;
+    let h = res.headers_mut();
+    h.set("Content-Type", ctype)?;
+    h.set("Cache-Control", "no-store")?;
+    h.set("X-Content-Type-Options", "nosniff")?;
+    Ok(res)
+}
+
 /// JSON response with a status code and no-store caching.
 pub fn json<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     let mut res = Response::from_json(value)?.with_status(status);

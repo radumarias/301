@@ -66,6 +66,7 @@ const fmt = {
   },
 };
 const shortUrl = (slug) => `${ORIGIN}/${slug}`;
+const field = (lbl, el, hint) => h("div", { class: "field" }, h("label", {}, lbl), el, hint && h("div", { class: "hint" }, hint));
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); toast("Copied " + text); }
   catch { toast("Copy failed", true); }
@@ -175,18 +176,19 @@ async function dashboard() {
   const range = sessionStorage.getItem("range") || "30d";
   const st = await api("GET", `/stats?range=${range}`);
   const pick = (r) => { sessionStorage.setItem("range", r); render(); };
+  const [chart, dims] = statsBlock(st);
   $app.replaceChildren(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Dashboard"), h("div", { class: "muted" }, "Human clicks; bots and link previews are counted separately.")), rangePicker(range, pick)),
     h("div", { class: "grid g4", style: "margin-bottom:16px" },
       stat("Clicks", st.clicks), stat("Links", st.links), stat("QR scans", st.qr), stat("Bot hits", st.bots)),
     h("div", { class: "grid", style: "gap:16px" },
-      statsBlock(st)[0],
+      chart,
       h("div", { class: "panel" }, h("h2", {}, "Top links"),
         (st.top_links || []).length ? h("table", {}, h("tbody", {}, st.top_links.map((l) =>
           h("tr", { class: "link-row", onclick: () => (location.hash = `#/links/${l.id}`) },
             h("td", {}, h("div", { class: "slug" }, "/" + l.slug), h("div", { class: "dest" }, l.title || l.url)),
             h("td", { class: "num" }, fmt.n(l.n)))))) : h("p", { class: "muted" }, "No clicks in this period.")),
-      statsBlock(st)[1]),
+      dims),
   );
 }
 const stat = (l, v) => h("div", { class: "panel stat" }, h("div", { class: "v" }, fmt.n(v)), h("div", { class: "l" }, l));
@@ -199,22 +201,25 @@ async function linksPage() {
   const search = h("input", { type: "search", placeholder: "Search slug, URL, title, notes", value: listState.q });
   let timer;
   search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => { listState.q = search.value; listState.offset = 0; linksPage().then(() => { const el = $app.querySelector("input[type=search]"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }); }, 250); });
-  const tagSel = h("select", { onchange: (e) => { listState.tag = e.target.value; listState.offset = 0; linksPage(); } },
+  const setFilter = (k) => (e) => { listState[k] = e.target.value; listState.offset = 0; linksPage(); };
+  const tagSel = h("select", { onchange: setFilter("tag") },
     h("option", { value: "" }, "All tags"), tags.map((t) => h("option", { value: t.tag, selected: t.tag === listState.tag }, `${t.tag} (${t.n})`)));
-  const statusSel = h("select", { onchange: (e) => { listState.status = e.target.value; listState.offset = 0; linksPage(); } },
+  const statusSel = h("select", { onchange: setFilter("status") },
     [["", "Any status"], ["active", "Active"], ["disabled", "Disabled"], ["expired", "Expired"], ["protected", "Password"]].map(([v, l]) => h("option", { value: v, selected: v === listState.status }, l)));
   const sortSel = h("select", { onchange: (e) => { const [s1, o] = e.target.value.split(":"); listState.sort = s1; listState.order = o; linksPage(); } },
     [["created:desc", "Newest"], ["created:asc", "Oldest"], ["clicks:desc", "Most clicks"], ["last_click:desc", "Recently clicked"], ["slug:asc", "Slug A→Z"]].map(([v, l]) =>
       h("option", { value: v, selected: v === `${listState.sort}:${listState.order}` }, l)));
 
   const sel = listState.selected;
-  const bulkBar = h("div", { class: "row", style: sel.size ? "" : "display:none" },
-    h("span", { class: "muted small" }, `${sel.size} selected`),
+  const selCount = h("span", { class: "muted small" });
+  const bulkBar = h("div", { class: "row" }, selCount,
     h("button", { class: "btn sm", onclick: () => bulk("tag") }, "Add tag"),
     h("button", { class: "btn sm", onclick: () => bulk("untag") }, "Remove tag"),
     h("button", { class: "btn sm", onclick: () => bulk("disable") }, "Disable"),
     h("button", { class: "btn sm", onclick: () => bulk("enable") }, "Enable"),
     h("button", { class: "btn sm danger", onclick: () => bulk("delete") }, "Delete"));
+  const syncBar = () => { bulkBar.style.display = sel.size ? "" : "none"; selCount.textContent = `${sel.size} selected`; };
+  syncBar();
   async function bulk(action) {
     let tags = [];
     if (action === "tag" || action === "untag") {
@@ -229,16 +234,15 @@ async function linksPage() {
     linksPage();
   }
 
-  const now = Date.now();
   const rows = page.items.map((l) => {
-    const cb = h("input", { type: "checkbox", checked: sel.has(l.id), onclick: (e) => e.stopPropagation(), onchange: (e) => { e.target.checked ? sel.add(l.id) : sel.delete(l.id); linksPage(); } });
+    const cb = h("input", { type: "checkbox", checked: sel.has(l.id), onclick: (e) => e.stopPropagation(), onchange: (e) => { e.target.checked ? sel.add(l.id) : sel.delete(l.id); syncBar(); } });
     return h("tr", { class: "link-row", onclick: () => (location.hash = `#/links/${l.id}`) },
       h("td", {}, cb),
       h("td", {},
         h("div", {}, h("span", { class: "slug" }, "/" + l.slug),
-          l.disabled && h("span", { class: "badge off" }, "OFF"),
+          l.status === "disabled" && h("span", { class: "badge off" }, "OFF"),
           l.has_password && h("span", { class: "badge lock" }, "PW"),
-          l.expires_at && l.expires_at <= now && h("span", { class: "badge exp" }, "EXPIRED")),
+          l.status === "expired" && h("span", { class: "badge exp" }, "EXPIRED")),
         h("div", { class: "dest" }, l.title ? `${l.title} · ${l.url}` : l.url),
         h("div", {}, l.tags.map((t) => h("span", { class: "tag" }, t)))),
       h("td", { class: "num" }, fmt.n(l.clicks), h("div", { class: "muted small" }, fmt.ago(l.last_click_at))),
@@ -246,7 +250,11 @@ async function linksPage() {
       h("td", {}, h("button", { class: "btn sm", onclick: (e) => { e.stopPropagation(); copy(shortUrl(l.slug)); } }, "Copy")));
   });
   const allBox = h("input", { type: "checkbox", checked: page.items.length > 0 && page.items.every((l) => sel.has(l.id)),
-    onchange: (e) => { page.items.forEach((l) => (e.target.checked ? sel.add(l.id) : sel.delete(l.id))); linksPage(); } });
+    onchange: (e) => {
+      page.items.forEach((l) => (e.target.checked ? sel.add(l.id) : sel.delete(l.id)));
+      $app.querySelectorAll("tbody input[type=checkbox]").forEach((c) => (c.checked = e.target.checked));
+      syncBar();
+    } });
 
   $app.replaceChildren(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Links"), h("div", { class: "muted" }, `${fmt.n(page.total)} links · press `, h("span", { class: "kbd" }, "n"), " for a new one, or paste a URL anywhere")), bulkBar),
@@ -266,10 +274,9 @@ async function linksPage() {
 function applyUtm(url, utm) {
   try {
     const u = new URL(url);
-    for (const k of ["source", "medium", "campaign", "term", "content"]) {
-      const v = (utm[k] || "").trim();
-      if (v) u.searchParams.set("utm_" + k, v);
-    }
+    const set = ["source", "medium", "campaign", "term", "content"].map((k) => ["utm_" + k, (utm[k] || "").trim()]).filter(([, v]) => v);
+    set.forEach(([k]) => u.searchParams.delete(k));
+    set.forEach(([k, v]) => u.searchParams.append(k, v));
     return u.toString();
   } catch { return url; }
 }
@@ -282,7 +289,6 @@ async function editPage(id) {
 
   const f = {};
   const inp = (key, attrs) => (f[key] = h("input", attrs));
-  const field = (lbl, el, hint) => h("div", { class: "field" }, h("label", {}, lbl), el, hint && h("div", { class: "hint" }, hint));
 
   inp("url", { type: "url", required: true, placeholder: "https://example.com/very/long/page", value: L.url });
   inp("slug", { type: "text", placeholder: isNew ? "leave empty to generate" : "", value: L.slug, autocomplete: "off", spellcheck: "false" });
@@ -337,7 +343,7 @@ async function editPage(id) {
   const form = h("form", { class: "panel", onsubmit: save },
     field("Destination URL", f.url),
     h("div", { class: "field" }, h("label", {}, "Short link"),
-      h("div", { class: "row", style: "flex-wrap:nowrap" }, h("span", { class: "muted mono small", style: "white-space:nowrap" }, ORIGIN.replace(/^https?:\/\//, "") + "/"), f.slug, styleSel, genBtn), slugStatus),
+      h("div", { class: "row slug-row" }, h("span", { class: "muted mono small", style: "white-space:nowrap" }, ORIGIN.replace(/^https?:\/\//, "") + "/"), f.slug, styleSel, genBtn), slugStatus),
     h("div", { class: "grid g2" }, field("Title", f.title), field("Tags", f.tags, "Comma separated")),
     field("Notes", f.notes),
     h("details", { class: "section", open: hasAdvanced(L.utm) || undefined }, h("summary", {}, "UTM builder"),
@@ -655,7 +661,6 @@ async function settingsPage() {
   const len = h("input", { type: "number", min: 4, max: 32, value: st.default_slug_length });
   const theme = h("select", {}, [["", "System"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => h("option", { value: v, selected: v === (localStorage.getItem("theme") || "") }, l)));
   theme.addEventListener("change", () => { try { localStorage.setItem("theme", theme.value); } catch {} applyTheme(); });
-  const field = (l, e, hint) => h("div", { class: "field" }, h("label", {}, l), e, hint && h("div", { class: "hint" }, hint));
   async function save(e) {
     e.preventDefault();
     try {
@@ -665,11 +670,11 @@ async function settingsPage() {
   }
   async function rebuild(btn) {
     btn.disabled = true;
-    let offset = 0, total = 0;
+    let after = 0, total = 0;
     try {
-      while (offset != null) {
-        const r = await api("POST", `/maintenance/rebuild-kv?offset=${offset}`);
-        total += r.written; offset = r.next_offset;
+      while (after != null) {
+        const r = await api("POST", `/maintenance/rebuild-kv?after=${after}`);
+        total += r.written; after = r.next_after;
         btn.textContent = `Rebuilding… ${total}`;
       }
       toast(`Rewrote ${total} KV records`);

@@ -1,13 +1,20 @@
 //! Persistence: D1 is the source of truth, KV is a read-through cache for redirects.
+//!
+//! Every link mutation goes through this module, which keeps KV in sync in one place
+//! (`sync_kv` / `forget_kv`).
 
-use crate::model::{validate_link, KvRecord, Link, LinkInput, LinkRow};
+use crate::model::{validate_redirect_type, validate_url, KvRecord, Link, LinkInput, LinkRow};
 use crate::slug::{self, Style};
 use crate::util::now_ms;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use wasm_bindgen::JsValue;
-use worker::{D1Database, Env, KvStore};
+use worker::{D1Database, D1PreparedStatement, Env, KvStore};
 
 pub const KV_CACHE_TTL: u64 = 60;
+
+pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -15,6 +22,20 @@ pub enum StoreError {
     NotFound,
     Conflict(String),
     Internal(worker::Error),
+}
+
+impl StoreError {
+    /// Message safe to show to the admin (internal details are logged, not returned).
+    pub fn public_message(&self) -> String {
+        match self {
+            StoreError::Bad(m) | StoreError::Conflict(m) => m.clone(),
+            StoreError::NotFound => "not found".into(),
+            StoreError::Internal(e) => {
+                worker::console_error!("internal: {e}");
+                "internal error".into()
+            }
+        }
+    }
 }
 
 impl From<worker::Error> for StoreError {
@@ -30,6 +51,16 @@ impl From<worker::kv::KvError> for StoreError {
 }
 
 pub type SResult<T> = std::result::Result<T, StoreError>;
+
+#[derive(Deserialize)]
+pub struct IdRow {
+    pub id: i64,
+}
+
+#[derive(Deserialize)]
+pub struct CountRow {
+    pub n: i64,
+}
 
 pub fn db(env: &Env) -> worker::Result<D1Database> {
     env.d1("DB")
@@ -63,6 +94,9 @@ fn json_or_null<T: Serialize>(v: &T, empty: bool) -> JsValue {
         s(&serde_json::to_string(v).unwrap_or_default())
     }
 }
+pub fn tags_json(tags: &[String]) -> JsValue {
+    s(&serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()))
+}
 
 pub fn kv_key(slug: &str) -> String {
     format!("s:{slug}")
@@ -92,19 +126,41 @@ impl Default for Settings {
     }
 }
 
-/// Settings for the redirect path: KV first (edge-cached), D1 as fallback.
-pub async fn settings_cached(env: &Env) -> Settings {
-    if let Ok(store) = kv(env) {
-        if let Ok(Some(s)) = store
-            .get("cfg")
-            .cache_ttl(KV_CACHE_TTL)
-            .json::<Settings>()
-            .await
-        {
-            return s;
+impl Settings {
+    pub fn validate(&self) -> Result<(), String> {
+        for u in [&self.root_url, &self.not_found_url].into_iter().flatten() {
+            validate_url(u)?;
         }
+        validate_redirect_type(self.default_redirect)?;
+        if !(4..=32).contains(&self.default_slug_length) {
+            return Err("default_slug_length must be between 4 and 32".into());
+        }
+        Ok(())
     }
-    settings(env).await.unwrap_or_default()
+
+    pub fn slug_style(&self) -> Style {
+        Style::parse(&self.default_slug_style)
+    }
+}
+
+/// Settings for the redirect path: KV first (edge-cached), D1 as fallback (and refill).
+pub async fn settings_cached(env: &Env) -> Settings {
+    let Ok(store) = kv(env) else {
+        return Settings::default();
+    };
+    if let Ok(Some(st)) = store
+        .get("cfg")
+        .cache_ttl(KV_CACHE_TTL)
+        .json::<Settings>()
+        .await
+    {
+        return st;
+    }
+    let st = settings(env).await.unwrap_or_default();
+    if let Ok(put) = store.put("cfg", serde_json::to_string(&st).unwrap_or_default()) {
+        let _ = put.execute().await;
+    }
+    st
 }
 
 pub async fn settings(env: &Env) -> worker::Result<Settings> {
@@ -122,14 +178,7 @@ pub async fn settings(env: &Env) -> worker::Result<Settings> {
 }
 
 pub async fn save_settings(env: &Env, st: &Settings) -> SResult<()> {
-    for u in [&st.root_url, &st.not_found_url].into_iter().flatten() {
-        crate::model::validate_url(u).map_err(StoreError::Bad)?;
-    }
-    if ![301, 302, 307, 308].contains(&st.default_redirect) {
-        return Err(StoreError::Bad(
-            "default_redirect must be 301, 302, 307 or 308".into(),
-        ));
-    }
+    st.validate().map_err(StoreError::Bad)?;
     let json = serde_json::to_string(st).unwrap_or_default();
     db(env)?
         .prepare("INSERT INTO settings (key, value) VALUES ('settings', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
@@ -140,64 +189,74 @@ pub async fn save_settings(env: &Env, st: &Settings) -> SResult<()> {
     Ok(())
 }
 
-// ---- Links ----
+// ---- Reading links ----
 
-const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at";
-
-pub async fn aliases_of(env: &Env, id: i64) -> worker::Result<Vec<String>> {
+/// Fills `aliases` for a set of links with one query per 90 links.
+pub async fn with_aliases(env: &Env, mut links: Vec<Link>) -> worker::Result<Vec<Link>> {
     #[derive(Deserialize)]
     struct Row {
         slug: String,
+        link_id: i64,
     }
+    if links.is_empty() {
+        return Ok(links);
+    }
+    let d = db(env)?;
+    let mut by_link: HashMap<i64, Vec<String>> = HashMap::new();
+    for chunk in links.chunks(90) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
+        let rows = d
+            .prepare(format!(
+                "SELECT slug, link_id FROM aliases WHERE link_id IN ({marks}) ORDER BY slug"
+            ))
+            .bind(&ids)?
+            .all()
+            .await?
+            .results::<Row>()?;
+        for r in rows {
+            by_link.entry(r.link_id).or_default().push(r.slug);
+        }
+    }
+    for l in &mut links {
+        l.aliases = by_link.remove(&l.id).unwrap_or_default();
+    }
+    Ok(links)
+}
+
+/// Runs a `SELECT {LINK_COLS} FROM links ...` query (pass the part after `FROM links`).
+pub async fn query_links(env: &Env, tail: &str, binds: &[JsValue]) -> worker::Result<Vec<Link>> {
     let rows = db(env)?
-        .prepare("SELECT slug FROM aliases WHERE link_id = ?1 ORDER BY slug")
-        .bind(&[n(id)])?
+        .prepare(format!("SELECT {LINK_COLS} FROM links {tail}"))
+        .bind(binds)?
         .all()
         .await?
-        .results::<Row>()?;
-    Ok(rows.into_iter().map(|r| r.slug).collect())
+        .results::<LinkRow>()?;
+    Ok(rows.into_iter().map(Link::from).collect())
 }
 
 pub async fn get_link(env: &Env, id: i64) -> worker::Result<Option<Link>> {
-    let row = db(env)?
-        .prepare(format!("SELECT {LINK_COLS} FROM links WHERE id = ?1"))
-        .bind(&[n(id)])?
-        .first::<LinkRow>(None)
-        .await?;
-    match row {
-        Some(r) => {
-            let mut l = Link::from(r);
-            l.aliases = aliases_of(env, l.id).await?;
-            Ok(Some(l))
-        }
-        None => Ok(None),
-    }
+    let links = query_links(env, "WHERE id = ?1", &[n(id)]).await?;
+    Ok(with_aliases(env, links).await?.pop())
 }
 
-/// Finds a link by its slug or one of its aliases.
+/// Finds a link by its slug or one of its aliases (aliases included).
 pub async fn get_link_by_slug(env: &Env, slug: &str) -> worker::Result<Option<Link>> {
-    let row = db(env)?
-        .prepare(format!(
-            "SELECT {LINK_COLS} FROM links WHERE slug = ?1 \
-             UNION ALL SELECT {cols} FROM links l JOIN aliases a ON a.link_id = l.id WHERE a.slug = ?1 LIMIT 1",
-            cols = LINK_COLS.split(", ").map(|c| format!("l.{c}")).collect::<Vec<_>>().join(", ")
-        ))
-        .bind(&[s(slug)])?
-        .first::<LinkRow>(None)
-        .await?;
-    Ok(row.map(Link::from))
+    let links = query_links(
+        env,
+        "WHERE slug = ?1 OR id = (SELECT link_id FROM aliases WHERE slug = ?1) LIMIT 1",
+        &[s(slug)],
+    )
+    .await?;
+    Ok(with_aliases(env, links).await?.pop())
 }
 
 /// Who owns a slug: Some(link_id) when taken (as slug or alias).
 pub async fn slug_owner(env: &Env, slug: &str) -> worker::Result<Option<i64>> {
-    #[derive(Deserialize)]
-    struct Row {
-        id: i64,
-    }
     let row = db(env)?
         .prepare("SELECT id FROM links WHERE slug = ?1 UNION ALL SELECT link_id AS id FROM aliases WHERE slug = ?1 LIMIT 1")
         .bind(&[s(slug)])?
-        .first::<Row>(None)
+        .first::<IdRow>(None)
         .await?;
     Ok(row.map(|r| r.id))
 }
@@ -213,6 +272,20 @@ pub async fn unique_slug(env: &Env, style: Style, length: usize) -> SResult<Stri
         "could not find a free slug, try again".into(),
     ))
 }
+
+/// Validates a requested slug and checks it is free (or already owned by `owner`).
+pub async fn claim_slug(env: &Env, requested: &str, owner: Option<i64>) -> SResult<String> {
+    let sl = slug::normalize(requested).ok_or_else(|| StoreError::Bad("slug is empty".into()))?;
+    slug::validate(&sl).map_err(StoreError::Bad)?;
+    match slug_owner(env, &sl).await? {
+        Some(o) if Some(o) != owner => Err(StoreError::Conflict(format!(
+            "slug '{sl}' is already taken"
+        ))),
+        _ => Ok(sl),
+    }
+}
+
+// ---- Writing links ----
 
 async fn apply_password(link: &mut Link, input: &LinkInput) -> SResult<()> {
     if let Some(p) = &input.password {
@@ -232,187 +305,168 @@ async fn apply_password(link: &mut Link, input: &LinkInput) -> SResult<()> {
     Ok(())
 }
 
-pub async fn create_link(env: &Env, input: &LinkInput) -> SResult<Link> {
-    let st = settings(env).await.unwrap_or_default();
-    let mut link = Link {
-        redirect_type: st.default_redirect,
-        passthrough: true,
-        source: "manual".into(),
-        ..Default::default()
-    };
+/// The 17 column values shared by INSERT and UPDATE, as ?1..?17.
+fn link_binds(l: &Link) -> Vec<JsValue> {
+    vec![
+        s(&l.slug),
+        s(&l.url),
+        os(&l.title),
+        os(&l.notes),
+        tags_json(&l.tags),
+        n(l.redirect_type as i64),
+        b(l.disabled),
+        on(l.expires_at),
+        on(l.max_clicks),
+        os(&l.fallback_url),
+        os(&l.password_hash),
+        b(l.passthrough),
+        json_or_null(&l.utm, l.utm.is_empty()),
+        json_or_null(&l.geo, l.geo.is_empty()),
+        json_or_null(&l.device, l.device.is_empty()),
+        s(&l.source),
+        n(l.updated_at),
+    ]
+}
+
+pub fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
+    let mut binds = link_binds(l);
+    binds.push(n(l.created_at));
+    db.prepare(
+        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING id",
+    )
+    .bind(&binds)
+}
+
+pub fn update_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
+    let mut binds = link_binds(l);
+    binds.push(n(l.id));
+    db.prepare(
+        "UPDATE links SET slug = ?1, url = ?2, title = ?3, notes = ?4, tags = ?5, redirect_type = ?6, disabled = ?7, expires_at = ?8, \
+         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17 \
+         WHERE id = ?18",
+    )
+    .bind(&binds)
+}
+
+/// Builds a new (unsaved) link from an input, with defaults from settings.
+pub async fn new_link(env: &Env, st: &Settings, input: &LinkInput, source: &str) -> SResult<Link> {
+    let mut link = Link::new(st.default_redirect, source);
     input.apply(&mut link).map_err(StoreError::Bad)?;
     apply_password(&mut link, input).await?;
-
-    link.slug = match input
-        .slug
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(sl) => {
-            slug::validate(sl).map_err(StoreError::Bad)?;
-            if slug_owner(env, sl).await?.is_some() {
-                return Err(StoreError::Conflict(format!(
-                    "slug '{sl}' is already taken"
-                )));
-            }
-            sl.to_string()
-        }
+    link.slug = match input.slug.as_deref().and_then(slug::normalize) {
+        Some(sl) => claim_slug(env, &sl, None).await?,
         None => {
-            let style = Style::parse(
-                input
-                    .slug_style
-                    .as_deref()
-                    .unwrap_or(&st.default_slug_style),
-            );
+            let style = input
+                .slug_style
+                .as_deref()
+                .map(Style::parse)
+                .unwrap_or(st.slug_style());
             unique_slug(env, style, st.default_slug_length).await?
         }
     };
     let now = now_ms();
     link.created_at = now;
     link.updated_at = now;
-    link.id = insert_link(env, &link).await?;
-    write_kv(env, &link).await?;
     Ok(link)
 }
 
-fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<worker::D1PreparedStatement> {
-    db.prepare(
-        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING id",
-    )
-    .bind(&[
-        s(&l.slug),
-        s(&l.url),
-        os(&l.title),
-        os(&l.notes),
-        s(&serde_json::to_string(&l.tags).unwrap_or_else(|_| "[]".into())),
-        n(l.redirect_type as i64),
-        b(l.disabled),
-        on(l.expires_at),
-        on(l.max_clicks),
-        os(&l.fallback_url),
-        os(&l.password_hash),
-        b(l.passthrough),
-        json_or_null(&l.utm, l.utm.is_empty()),
-        json_or_null(&l.geo, l.geo.is_empty()),
-        json_or_null(&l.device, l.device.is_empty()),
-        s(&l.source),
-        n(l.created_at),
-        n(l.updated_at),
-    ])
+pub async fn create_link(env: &Env, input: &LinkInput) -> SResult<Link> {
+    let st = settings(env).await.unwrap_or_default();
+    let mut link = new_link(env, &st, input, "manual").await?;
+    let row = insert_stmt(&db(env)?, &link)?.first::<IdRow>(None).await?;
+    link.id = row
+        .ok_or_else(|| {
+            StoreError::Internal(worker::Error::RustError("insert returned no id".into()))
+        })?
+        .id;
+    sync_kv(env, &link).await?;
+    Ok(link.with_status())
 }
 
-pub fn insert_statement(db: &D1Database, l: &Link) -> worker::Result<worker::D1PreparedStatement> {
-    insert_stmt(db, l)
-}
-
-async fn insert_link(env: &Env, l: &Link) -> SResult<i64> {
-    #[derive(Deserialize)]
-    struct Row {
-        id: i64,
-    }
-    let d = db(env)?;
-    let row = insert_stmt(&d, l)?.first::<Row>(None).await?;
-    row.map(|r| r.id).ok_or_else(|| {
-        StoreError::Internal(worker::Error::RustError("insert returned no id".into()))
-    })
-}
-
-pub fn update_statement(db: &D1Database, l: &Link) -> worker::Result<worker::D1PreparedStatement> {
-    db.prepare(
-        "UPDATE links SET slug = ?2, url = ?3, title = ?4, notes = ?5, tags = ?6, redirect_type = ?7, disabled = ?8, expires_at = ?9, \
-         max_clicks = ?10, fallback_url = ?11, password_hash = ?12, passthrough = ?13, utm = ?14, geo = ?15, device = ?16, source = ?17, updated_at = ?18 \
-         WHERE id = ?1",
-    )
-    .bind(&[
-        n(l.id),
-        s(&l.slug),
-        s(&l.url),
-        os(&l.title),
-        os(&l.notes),
-        s(&serde_json::to_string(&l.tags).unwrap_or_else(|_| "[]".into())),
-        n(l.redirect_type as i64),
-        b(l.disabled),
-        on(l.expires_at),
-        on(l.max_clicks),
-        os(&l.fallback_url),
-        os(&l.password_hash),
-        b(l.passthrough),
-        json_or_null(&l.utm, l.utm.is_empty()),
-        json_or_null(&l.geo, l.geo.is_empty()),
-        json_or_null(&l.device, l.device.is_empty()),
-        s(&l.source),
-        n(l.updated_at),
-    ])
-}
-
-pub async fn update_link(env: &Env, id: i64, input: &LinkInput) -> SResult<Link> {
-    let mut link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
+/// Applies `input` to an already-loaded link and returns the statements that persist it.
+/// The caller runs them (alone or in a batch) and then calls `sync_kv`.
+pub async fn prepare_update(
+    env: &Env,
+    link: &mut Link,
+    input: &LinkInput,
+) -> SResult<Vec<D1PreparedStatement>> {
     let old_slug = link.slug.clone();
-    input.apply(&mut link).map_err(StoreError::Bad)?;
-    apply_password(&mut link, input).await?;
+    input.apply(link).map_err(StoreError::Bad)?;
+    apply_password(link, input).await?;
     let d = db(env)?;
     let mut stmts = vec![];
 
-    if let Some(new_slug) = input
+    if let Some(requested) = input
         .slug
         .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != old_slug)
+        .and_then(slug::normalize)
+        .filter(|s| *s != old_slug)
     {
-        slug::validate(new_slug).map_err(StoreError::Bad)?;
-        match slug_owner(env, new_slug).await? {
-            Some(owner) if owner != id => {
-                return Err(StoreError::Conflict(format!(
-                    "slug '{new_slug}' is already taken"
-                )));
-            }
-            Some(_) => {
-                // Renaming back to one of our own aliases: drop that alias.
-                stmts.push(
-                    d.prepare("DELETE FROM aliases WHERE slug = ?1")
-                        .bind(&[s(new_slug)])?,
-                );
-                link.aliases.retain(|a| a != new_slug);
-            }
-            None => {}
+        let new_slug = claim_slug(env, &requested, Some(link.id)).await?;
+        // Renaming back to one of our own aliases: drop that alias.
+        if link.aliases.contains(&new_slug) {
+            stmts.push(
+                d.prepare("DELETE FROM aliases WHERE slug = ?1")
+                    .bind(&[s(&new_slug)])?,
+            );
+            link.aliases.retain(|a| *a != new_slug);
         }
         // The old slug keeps working as an alias.
         stmts.push(
             d.prepare("INSERT OR IGNORE INTO aliases (slug, link_id) VALUES (?1, ?2)")
-                .bind(&[s(&old_slug), n(id)])?,
+                .bind(&[s(&old_slug), n(link.id)])?,
         );
-        link.aliases.push(old_slug.clone());
+        link.aliases.push(old_slug);
         link.aliases.sort();
-        link.slug = new_slug.to_string();
+        link.slug = new_slug;
     }
-    validate_link(&link).map_err(StoreError::Bad)?;
     link.updated_at = now_ms();
-    stmts.insert(0, update_statement(&d, &link)?);
+    stmts.insert(0, update_stmt(&d, link)?);
+    Ok(stmts)
+}
+
+pub async fn update_loaded(env: &Env, mut link: Link, input: &LinkInput) -> SResult<Link> {
+    let stmts = prepare_update(env, &mut link, input).await?;
+    db(env)?.batch(stmts).await?;
+    sync_kv(env, &link).await?;
+    Ok(link.with_status())
+}
+
+pub async fn update_link(env: &Env, id: i64, input: &LinkInput) -> SResult<Link> {
+    let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
+    update_loaded(env, link, input).await
+}
+
+/// Deletes links (with their aliases and clicks) and their KV records.
+pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
+    let d = db(env)?;
+    let mut stmts = vec![];
+    for chunk in links.chunks(90) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
+        for table in [
+            "clicks WHERE link_id",
+            "aliases WHERE link_id",
+            "links WHERE id",
+        ] {
+            stmts.push(
+                d.prepare(format!("DELETE FROM {table} IN ({marks})"))
+                    .bind(&ids)?,
+            );
+        }
+    }
     d.batch(stmts).await?;
-    write_kv(env, &link).await?;
-    Ok(link)
+    let slugs: Vec<&str> = links
+        .iter()
+        .flat_map(|l| std::iter::once(l.slug.as_str()).chain(l.aliases.iter().map(String::as_str)))
+        .collect();
+    forget_kv(env, &slugs).await
 }
 
 pub async fn delete_link(env: &Env, id: i64) -> SResult<()> {
     let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    let d = db(env)?;
-    d.batch(vec![
-        d.prepare("DELETE FROM clicks WHERE link_id = ?1")
-            .bind(&[n(id)])?,
-        d.prepare("DELETE FROM aliases WHERE link_id = ?1")
-            .bind(&[n(id)])?,
-        d.prepare("DELETE FROM links WHERE id = ?1")
-            .bind(&[n(id)])?,
-    ])
-    .await?;
-    let store = kv(env)?;
-    store.delete(&kv_key(&link.slug)).await?;
-    for a in &link.aliases {
-        store.delete(&kv_key(a)).await?;
-    }
-    Ok(())
+    delete_links(env, &[link]).await
 }
 
 pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {
@@ -421,50 +475,62 @@ pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {
         .bind(&[s(alias), n(id)])?
         .run()
         .await?;
-    let changed = res.meta()?.and_then(|m| m.changes).unwrap_or(0);
-    if changed == 0 {
+    if res.meta()?.and_then(|m| m.changes).unwrap_or(0) == 0 {
         return Err(StoreError::NotFound);
     }
-    kv(env)?.delete(&kv_key(alias)).await?;
-    Ok(())
+    forget_kv(env, &[alias]).await
 }
 
-/// Writes the KV record for a link's slug and all its aliases.
-pub async fn write_kv(env: &Env, link: &Link) -> SResult<()> {
+// ---- KV sync (the only place KV is written for links) ----
+
+/// Writes the KV record for a link's slug and all its aliases, concurrently.
+pub async fn sync_kv(env: &Env, link: &Link) -> SResult<()> {
     let rec = serde_json::to_string(&KvRecord::from_link(link)).unwrap_or_default();
     let store = kv(env)?;
-    store
-        .put(&kv_key(&link.slug), rec.clone())?
-        .execute()
-        .await?;
-    for a in &link.aliases {
-        store.put(&kv_key(a), rec.clone())?.execute().await?;
+    let keys: Vec<String> = std::iter::once(&link.slug)
+        .chain(&link.aliases)
+        .map(|s| kv_key(s))
+        .collect();
+    let mut puts = vec![];
+    for k in &keys {
+        puts.push(store.put(k, rec.clone())?.execute());
+    }
+    for r in join_all(puts).await {
+        r?;
     }
     Ok(())
 }
 
-/// Redirect-path lookup: KV, then D1 (read-through fill).
-pub async fn lookup(env: &Env, slug: &str) -> worker::Result<Option<KvRecord>> {
+/// Removes KV records so the next redirect refills them from D1.
+pub async fn forget_kv(env: &Env, slugs: &[&str]) -> SResult<()> {
     let store = kv(env)?;
-    let key = kv_key(slug);
-    if let Ok(Some(rec)) = store
-        .get(&key)
+    let keys: Vec<String> = slugs.iter().map(|s| kv_key(s)).collect();
+    for r in join_all(keys.iter().map(|k| store.delete(k))).await {
+        r?;
+    }
+    Ok(())
+}
+
+/// Redirect-path lookup: KV first; on a miss, D1. The bool says the KV record should be
+/// filled (the caller does it after responding).
+pub async fn lookup(env: &Env, slug: &str) -> worker::Result<Option<(KvRecord, bool)>> {
+    if let Ok(Some(rec)) = kv(env)?
+        .get(&kv_key(slug))
         .cache_ttl(KV_CACHE_TTL)
         .json::<KvRecord>()
         .await
     {
-        return Ok(Some(rec));
+        return Ok(Some((rec, false)));
     }
-    let Some(link) = get_link_by_slug(env, slug).await? else {
-        return Ok(None);
-    };
-    let rec = KvRecord::from_link(&link);
-    if let Ok(json) = serde_json::to_string(&rec) {
-        if let Ok(put) = store.put(&key, json) {
-            let _ = put.execute().await;
-        }
-    }
-    Ok(Some(rec))
+    Ok(get_link_by_slug(env, slug)
+        .await?
+        .map(|l| (KvRecord::from_link(&l), true)))
+}
+
+pub async fn fill_kv(env: &Env, slug: &str, rec: &KvRecord) -> SResult<()> {
+    let json = serde_json::to_string(rec).unwrap_or_default();
+    kv(env)?.put(&kv_key(slug), json)?.execute().await?;
+    Ok(())
 }
 
 pub async fn click_count(env: &Env, id: i64) -> worker::Result<i64> {

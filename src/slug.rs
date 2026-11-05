@@ -211,6 +211,12 @@ pub fn generate(style: Style, length: usize, attempt: usize) -> String {
 
 const RESERVED: &[&str] = &["_", "api", "robots.txt", "favicon.ico", "favicon.svg"];
 
+/// Trims whitespace and surrounding slashes; `None` when nothing is left.
+pub fn normalize(s: &str) -> Option<String> {
+    let t = s.trim().trim_matches('/');
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// Validates a custom slug; returns a human-readable reason on failure.
 pub fn validate(slug: &str) -> Result<(), String> {
     if slug.is_empty() || slug.len() > 128 {

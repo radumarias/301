@@ -21,6 +21,7 @@ base64 = "0.22"
 url = "2"
 getrandom = { version = "0.2", features = ["js"] }
 percent-encoding = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = "s"

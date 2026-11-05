@@ -748,6 +748,7 @@ name = "xorio-301"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "futures-util",
  "getrandom",
  "js-sys",
  "percent-encoding",

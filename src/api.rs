@@ -1,26 +1,25 @@
 //! Admin JSON API under `/api`. Every route requires a verified Access identity.
 
-use crate::auth::{self, AuthError, Identity};
-use crate::model::{Link, LinkInput, LinkRow};
+use crate::auth::{self, AuthError};
+use crate::model::{Link, LinkInput};
 use crate::slug::Style;
-use crate::store::{self, n, s, SResult, StoreError};
-use crate::util::{csv_field, json, json_error, now_ms};
+use crate::store::{self, n, s, CountRow, SResult, StoreError};
+use crate::util::{self, csv_field, iso, json, json_error, now_ms};
 use crate::{import, qr};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wasm_bindgen::JsValue;
 use worker::{Env, Method, Request, Response, Result};
 
 fn store_err(e: StoreError) -> Result<Response> {
-    match e {
-        StoreError::Bad(m) => json_error(m, 400),
-        StoreError::NotFound => json_error("not found", 404),
-        StoreError::Conflict(m) => json_error(m, 409),
-        StoreError::Internal(e) => {
-            worker::console_error!("internal: {e}");
-            json_error("internal error", 500)
-        }
-    }
+    let status = match e {
+        StoreError::Bad(_) => 400,
+        StoreError::NotFound => 404,
+        StoreError::Conflict(_) => 409,
+        StoreError::Internal(_) => 500,
+    };
+    json_error(e.public_message(), status)
 }
 
 fn respond<T: Serialize>(r: SResult<T>, status: u16) -> Result<Response> {
@@ -30,12 +29,24 @@ fn respond<T: Serialize>(r: SResult<T>, status: u16) -> Result<Response> {
     }
 }
 
-pub async fn identity(req: &Request, env: &Env) -> std::result::Result<Identity, Response> {
-    match auth::verify(req, env).await {
-        Ok(id) => Ok(id),
-        Err(AuthError::NotConfigured(m)) => Err(json_error(m, 503).unwrap()),
-        Err(AuthError::Denied(m)) => Err(json_error(m, 403).unwrap()),
-    }
+fn ok_json() -> serde_json::Value {
+    serde_json::json!({ "ok": true })
+}
+
+/// Parses a JSON request body, or produces the 400 response to return.
+async fn body<T: DeserializeOwned>(req: &mut Request) -> std::result::Result<T, Response> {
+    req.json()
+        .await
+        .map_err(|e| json_error(format!("invalid JSON: {e}"), 400).unwrap())
+}
+
+macro_rules! body {
+    ($req:expr) => {
+        match body(&mut $req).await {
+            Ok(v) => v,
+            Err(r) => return Ok(r),
+        }
+    };
 }
 
 /// Rejects cross-site writes: browsers always send Origin on POST/PATCH/DELETE.
@@ -51,136 +62,85 @@ fn same_origin(req: &Request) -> bool {
 }
 
 pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
-    let who = match identity(&req, &env).await {
+    let who = match auth::verify(&req, &env).await {
         Ok(w) => w,
-        Err(r) => return Ok(r),
+        Err(AuthError::NotConfigured(m)) => return json_error(m, 503),
+        Err(AuthError::Denied(m)) => return json_error(m, 403),
     };
     if !same_origin(&req) {
         return json_error("cross-origin request refused", 403);
     }
     let url = req.url()?;
     let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let q = |k: &str| query.get(k).map(String::as_str);
     let path = req.path();
     let segs: Vec<&str> = path
         .trim_start_matches("/api/")
         .trim_end_matches('/')
         .split('/')
         .collect();
-    let method = req.method();
+    // `/api/links/<id>/...`: parse the id once.
+    let link_id = match segs.as_slice() {
+        ["links", id, ..] if *id != "bulk" => match id.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => return json_error("bad id", 400),
+        },
+        _ => None,
+    };
 
-    match (method, segs.as_slice()) {
-        (Method::Get, ["me"]) => json(&serde_json::json!({ "email": who.email }), 200),
+    match (req.method(), segs.as_slice(), link_id) {
+        (Method::Get, ["me"], _) => json(&serde_json::json!({ "email": who.email }), 200),
 
-        (Method::Get, ["links"]) => list_links(&env, &query).await,
-        (Method::Post, ["links"]) => {
-            let input: LinkInput = match req.json().await {
-                Ok(i) => i,
-                Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-            };
+        (Method::Get, ["links"], _) => list_links(&env, &query).await,
+        (Method::Post, ["links"], _) => {
+            let input: LinkInput = body!(req);
             respond(store::create_link(&env, &input).await, 201)
         }
-        (Method::Post, ["links", "bulk"]) => {
-            let body: Bulk = match req.json().await {
-                Ok(b) => b,
-                Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-            };
-            bulk(&env, body).await
+        (Method::Post, ["links", "bulk"], _) => {
+            let b: Bulk = body!(req);
+            bulk(&env, b).await
         }
-        (Method::Get, ["links", id]) => match id.parse::<i64>() {
-            Ok(id) => match store::get_link(&env, id).await? {
-                Some(l) => json(&l, 200),
-                None => json_error("not found", 404),
-            },
-            Err(_) => json_error("bad id", 400),
+        (Method::Get, ["links", _], Some(id)) => match store::get_link(&env, id).await? {
+            Some(l) => json(&l, 200),
+            None => json_error("not found", 404),
         },
-        (Method::Patch, ["links", id]) | (Method::Put, ["links", id]) => {
-            let Ok(id) = id.parse::<i64>() else {
-                return json_error("bad id", 400);
-            };
-            let input: LinkInput = match req.json().await {
-                Ok(i) => i,
-                Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-            };
+        (Method::Patch | Method::Put, ["links", _], Some(id)) => {
+            let input: LinkInput = body!(req);
             respond(store::update_link(&env, id, &input).await, 200)
         }
-        (Method::Delete, ["links", id]) => {
-            let Ok(id) = id.parse::<i64>() else {
-                return json_error("bad id", 400);
-            };
-            respond(
-                store::delete_link(&env, id)
-                    .await
-                    .map(|_| serde_json::json!({"ok": true})),
-                200,
-            )
+        (Method::Delete, ["links", _], Some(id)) => {
+            respond(store::delete_link(&env, id).await.map(|_| ok_json()), 200)
         }
-        (Method::Delete, ["links", id, "aliases", alias @ ..]) => {
-            let Ok(id) = id.parse::<i64>() else {
-                return json_error("bad id", 400);
-            };
-            let alias = alias.join("/");
-            respond(
-                store::delete_alias(&env, id, &alias)
-                    .await
-                    .map(|_| serde_json::json!({"ok": true})),
-                200,
-            )
+        (Method::Delete, ["links", _, "aliases", alias @ ..], Some(id)) => respond(
+            store::delete_alias(&env, id, &alias.join("/"))
+                .await
+                .map(|_| ok_json()),
+            200,
+        ),
+        (Method::Get, ["links", _, "stats"], Some(id)) => {
+            stats(&env, Some(id), q("range").unwrap_or("30d")).await
         }
-        (Method::Get, ["links", id, "stats"]) => {
-            let Ok(id) = id.parse::<i64>() else {
-                return json_error("bad id", 400);
-            };
-            stats(
-                &env,
-                Some(id),
-                query.get("range").map(String::as_str).unwrap_or("30d"),
-            )
-            .await
-        }
-        (Method::Get, ["links", id, "qr.svg"]) => {
-            let Ok(id) = id.parse::<i64>() else {
-                return json_error("bad id", 400);
-            };
+        (Method::Get, ["links", _, "qr.svg"], Some(id)) => {
             let Some(link) = store::get_link(&env, id).await? else {
                 return json_error("not found", 404);
             };
-            let track = query.get("track").map(String::as_str) != Some("0");
+            let track = q("track") != Some("0");
             let data = format!(
                 "{}/{}{}",
                 url.origin().ascii_serialization(),
                 link.slug,
                 if track { "?qr=1" } else { "" }
             );
-            let size = query
-                .get("size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(512);
-            match qr::svg(
-                &data,
-                query.get("fg").map(String::as_str),
-                query.get("bg").map(String::as_str),
-                query.get("ecc").map(String::as_str),
-                size,
-            ) {
-                Ok(svg) => {
-                    let mut res = Response::ok(svg)?;
-                    res.headers_mut().set("Content-Type", "image/svg+xml")?;
-                    res.headers_mut().set("Cache-Control", "no-store")?;
-                    Ok(res)
-                }
+            let size = q("size").and_then(|v| v.parse().ok()).unwrap_or(512);
+            match qr::svg(&data, q("fg"), q("bg"), q("ecc"), size) {
+                Ok(svg) => util::body(svg, "image/svg+xml"),
                 Err(e) => json_error(e, 400),
             }
         }
-        (Method::Get, ["slug"]) => {
+        (Method::Get, ["slug"], _) => {
             let st = store::settings(&env).await.unwrap_or_default();
-            let style = Style::parse(
-                query
-                    .get("style")
-                    .map(String::as_str)
-                    .unwrap_or(&st.default_slug_style),
-            );
-            let len = query
-                .get("length")
+            let style = q("style").map(Style::parse).unwrap_or(st.slug_style());
+            let len = q("length")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(st.default_slug_length);
             respond(
@@ -190,62 +150,36 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
                 200,
             )
         }
-        (Method::Get, ["slug", "check"]) => {
-            let slug = query.get("slug").cloned().unwrap_or_default();
-            let valid = crate::slug::validate(&slug);
-            let taken = store::slug_owner(&env, &slug).await?;
+        (Method::Get, ["slug", "check"], _) => {
+            let slug = q("slug").unwrap_or_default();
+            let valid = crate::slug::validate(slug);
+            let taken = store::slug_owner(&env, slug).await?;
             json(
                 &serde_json::json!({ "valid": valid.is_ok(), "reason": valid.err(), "taken_by": taken }),
                 200,
             )
         }
-        (Method::Get, ["stats"]) => {
-            stats(
-                &env,
-                None,
-                query.get("range").map(String::as_str).unwrap_or("30d"),
-            )
-            .await
-        }
-        (Method::Get, ["tags"]) => tags(&env).await,
-        (Method::Get, ["settings"]) => json(&store::settings(&env).await?, 200),
-        (Method::Put, ["settings"]) => {
-            let st: store::Settings = match req.json().await {
-                Ok(s) => s,
-                Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-            };
+        (Method::Get, ["stats"], _) => stats(&env, None, q("range").unwrap_or("30d")).await,
+        (Method::Get, ["tags"], _) => tags(&env).await,
+        (Method::Get, ["settings"], _) => json(&store::settings(&env).await?, 200),
+        (Method::Put, ["settings"], _) => {
+            let st: store::Settings = body!(req);
             respond(store::save_settings(&env, &st).await.map(|_| st), 200)
         }
-        (Method::Post, ["import", "fetch"]) => {
-            let body: import::FetchRequest = match req.json().await {
-                Ok(b) => b,
-                Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-            };
-            match import::fetch_page(&body).await {
+        (Method::Post, ["import", "fetch"], _) => {
+            let b: import::FetchRequest = body!(req);
+            match import::fetch_page(&b).await {
                 Ok(page) => json(&page, 200),
                 Err(e) => json_error(e, 502),
             }
         }
-        (Method::Post, ["import", "commit"]) => {
-            let body: import::CommitRequest = match req.json().await {
-                Ok(b) => b,
-                Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-            };
-            respond(import::commit(&env, body).await, 200)
+        (Method::Post, ["import", "commit"], _) => {
+            let b: import::CommitRequest = body!(req);
+            respond(import::commit(&env, b).await, 200)
         }
-        (Method::Get, ["export"]) => {
-            export(
-                &env,
-                query.get("format").map(String::as_str).unwrap_or("csv"),
-            )
-            .await
-        }
-        (Method::Post, ["maintenance", "rebuild-kv"]) => {
-            let offset = query
-                .get("offset")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0i64);
-            rebuild_kv(&env, offset).await
+        (Method::Get, ["export"], _) => export(&env, q("format").unwrap_or("csv")).await,
+        (Method::Post, ["maintenance", "rebuild-kv"], _) => {
+            rebuild_kv(&env, q("after").and_then(|v| v.parse().ok()).unwrap_or(0)).await
         }
         _ => json_error("no such endpoint", 404),
     }
@@ -259,38 +193,33 @@ struct Page<T> {
     total: i64,
 }
 
-#[derive(Deserialize)]
-struct Count {
-    n: i64,
-}
+const EXPIRED_SQL: &str = "((expires_at IS NOT NULL AND expires_at <= ?) OR (max_clicks IS NOT NULL AND clicks >= max_clicks))";
 
 async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> {
-    let mut wheres: Vec<&str> = vec![];
+    let mut wheres: Vec<String> = vec![];
     let mut binds: Vec<JsValue> = vec![];
     if let Some(text) = q.get("q").map(|t| t.trim()).filter(|t| !t.is_empty()) {
-        wheres.push("(slug LIKE ? OR url LIKE ? OR title LIKE ? OR notes LIKE ?)");
-        let like = format!("%{text}%");
-        for _ in 0..4 {
-            binds.push(s(&like));
-        }
+        wheres.push("(slug LIKE ?1 OR url LIKE ?1 OR title LIKE ?1 OR notes LIKE ?1)".into());
+        binds.push(s(&format!("%{text}%")));
     }
     if let Some(tag) = q.get("tag").filter(|t| !t.is_empty()) {
-        wheres.push("EXISTS (SELECT 1 FROM json_each(links.tags) WHERE value = ?)");
+        wheres.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(links.tags) WHERE value = ?{})",
+            binds.len() + 1
+        ));
         binds.push(s(tag));
     }
-    let now = now_ms();
+    let now_bind = format!("?{}", binds.len() + 1);
+    let expired = EXPIRED_SQL.replace('?', &now_bind);
     match q.get("status").map(String::as_str) {
-        Some("disabled") => wheres.push("disabled = 1"),
-        Some("expired") => {
-            wheres.push("(expires_at IS NOT NULL AND expires_at <= ?)");
-            binds.push(n(now));
-        }
-        Some("active") => {
-            wheres.push("disabled = 0 AND (expires_at IS NULL OR expires_at > ?)");
-            binds.push(n(now));
-        }
-        Some("protected") => wheres.push("password_hash IS NOT NULL"),
+        Some("disabled") => wheres.push("disabled = 1".into()),
+        Some("expired") => wheres.push(format!("disabled = 0 AND {expired}")),
+        Some("active") => wheres.push(format!("disabled = 0 AND NOT {expired}")),
+        Some("protected") => wheres.push("password_hash IS NOT NULL".into()),
         _ => {}
+    }
+    if wheres.iter().any(|w| w.contains(&now_bind)) {
+        binds.push(n(now_ms()));
     }
     let where_sql = if wheres.is_empty() {
         String::new()
@@ -321,26 +250,26 @@ async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> 
         .max(0);
 
     let d = store::db(env)?;
-    let total = d
-        .prepare(format!("SELECT COUNT(*) AS n FROM links {where_sql}"))
-        .bind(&binds)?
-        .first::<Count>(None)
-        .await?
+    let res = d
+        .batch(vec![
+            d.prepare(format!("SELECT COUNT(*) AS n FROM links {where_sql}")).bind(&binds)?,
+            d.prepare(format!(
+                "SELECT {} FROM links {where_sql} ORDER BY {sort} {order}, id DESC LIMIT {limit} OFFSET {offset}",
+                store::LINK_COLS
+            ))
+            .bind(&binds)?,
+        ])
+        .await?;
+    let total = res[0]
+        .results::<CountRow>()?
+        .first()
         .map(|c| c.n)
         .unwrap_or(0);
-    let mut page_binds = binds.clone();
-    page_binds.push(n(limit));
-    page_binds.push(n(offset));
-    let rows = d
-        .prepare(format!(
-            "SELECT id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at \
-             FROM links {where_sql} ORDER BY {sort} {order}, id DESC LIMIT ? OFFSET ?"
-        ))
-        .bind(&page_binds)?
-        .all()
-        .await?
-        .results::<LinkRow>()?;
-    let items: Vec<Link> = rows.into_iter().map(Link::from).collect();
+    let items: Vec<Link> = res[1]
+        .results::<crate::model::LinkRow>()?
+        .into_iter()
+        .map(Link::from)
+        .collect();
     json(&Page { items, total }, 200)
 }
 
@@ -372,45 +301,66 @@ async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
     if body.ids.len() > 200 {
         return json_error("at most 200 links per bulk action", 400);
     }
-    let mut done = 0;
+    let input = match body.action.as_str() {
+        "delete" => None,
+        "disable" | "enable" => Some(LinkInput {
+            disabled: Some(body.action == "disable"),
+            ..Default::default()
+        }),
+        "tag" => Some(LinkInput {
+            add_tags: Some(body.tags),
+            ..Default::default()
+        }),
+        "untag" => Some(LinkInput {
+            remove_tags: Some(body.tags),
+            ..Default::default()
+        }),
+        _ => return json_error("action must be tag, untag, disable, enable or delete", 400),
+    };
+    if body.ids.is_empty() {
+        return json(&serde_json::json!({ "done": 0, "errors": [] }), 200);
+    }
+    let marks = vec!["?"; body.ids.len()].join(",");
+    let ids: Vec<JsValue> = body.ids.iter().map(|id| n(*id)).collect();
+    let links = store::with_aliases(
+        env,
+        store::query_links(env, &format!("WHERE id IN ({marks})"), &ids).await?,
+    )
+    .await?;
+
+    let Some(input) = input else {
+        return respond(
+            store::delete_links(env, &links)
+                .await
+                .map(|_| serde_json::json!({ "done": links.len(), "errors": [] })),
+            200,
+        );
+    };
+    // One D1 batch for all updates, then one concurrent KV sync per link.
+    let mut stmts = vec![];
+    let mut updated = vec![];
     let mut errors = vec![];
-    for id in body.ids {
-        let r = match body.action.as_str() {
-            "delete" => store::delete_link(env, id).await,
-            "disable" | "enable" => {
-                let input = LinkInput {
-                    disabled: Some(body.action == "disable"),
-                    ..Default::default()
-                };
-                store::update_link(env, id, &input).await.map(|_| ())
+    for mut l in links {
+        match store::prepare_update(env, &mut l, &input).await {
+            Ok(st) => {
+                stmts.extend(st);
+                updated.push(l);
             }
-            "tag" | "untag" => match store::get_link(env, id).await {
-                Ok(Some(l)) => {
-                    let mut tags = l.tags.clone();
-                    if body.action == "tag" {
-                        tags.extend(body.tags.iter().cloned());
-                    } else {
-                        let rm: Vec<String> =
-                            body.tags.iter().map(|t| t.trim().to_lowercase()).collect();
-                        tags.retain(|t| !rm.contains(t));
-                    }
-                    let input = LinkInput {
-                        tags: Some(tags),
-                        ..Default::default()
-                    };
-                    store::update_link(env, id, &input).await.map(|_| ())
-                }
-                Ok(None) => Err(StoreError::NotFound),
-                Err(e) => Err(e.into()),
-            },
-            _ => return json_error("action must be tag, untag, disable, enable or delete", 400),
-        };
-        match r {
-            Ok(()) => done += 1,
-            Err(e) => errors.push(serde_json::json!({ "id": id, "error": format!("{e:?}") })),
+            Err(e) => errors.push(serde_json::json!({ "id": l.id, "error": e.public_message() })),
         }
     }
-    json(&serde_json::json!({ "done": done, "errors": errors }), 200)
+    if !stmts.is_empty() {
+        store::db(env)?.batch(stmts).await?;
+    }
+    for r in futures_util::future::join_all(updated.iter().map(|l| store::sync_kv(env, l))).await {
+        if let Err(e) = r {
+            return store_err(e);
+        }
+    }
+    json(
+        &serde_json::json!({ "done": updated.len(), "errors": errors }),
+        200,
+    )
 }
 
 // ---- Stats ----
@@ -440,14 +390,47 @@ struct Bucket {
     n: i64,
 }
 
+const DIMENSIONS: [&str; 6] = ["country", "referrer", "device", "os", "browser", "city"];
+
 async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
     let (since, bucket) = range(r);
     let d = store::db(env)?;
-    let (filter, mut binds): (&str, Vec<JsValue>) = match link {
-        Some(id) => ("link_id = ? AND ts >= ?", vec![n(id), n(since)]),
-        None => ("ts >= ?", vec![n(since)]),
+    let (filter, binds): (&str, Vec<JsValue>) = match link {
+        Some(id) => ("link_id = ?1 AND ts >= ?2", vec![n(id), n(since)]),
+        None => ("ts >= ?1", vec![n(since)]),
     };
-    let base = binds.clone();
+
+    // Everything in one D1 round trip.
+    let mut stmts = vec![
+        d.prepare(format!(
+            "SELECT SUM(CASE WHEN bot = 0 THEN 1 ELSE 0 END) AS humans, SUM(bot) AS bots, SUM(CASE WHEN bot = 0 THEN qr ELSE 0 END) AS qr FROM clicks WHERE {filter}"
+        ))
+        .bind(&binds)?,
+        // `bucket` is a constant from `range`, not user input.
+        d.prepare(format!(
+            "SELECT CAST(ts / {bucket} AS INTEGER) * {bucket} AS t, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0 GROUP BY t ORDER BY t"
+        ))
+        .bind(&binds)?,
+    ];
+    for col in DIMENSIONS {
+        stmts.push(
+            d.prepare(format!(
+                "SELECT {col} AS k, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0 GROUP BY {col} ORDER BY n DESC LIMIT 10"
+            ))
+            .bind(&binds)?,
+        );
+    }
+    if link.is_none() {
+        stmts.push(
+            d.prepare(
+                "SELECT l.id, l.slug, l.url, l.title, COUNT(*) AS n FROM clicks c JOIN links l ON l.id = c.link_id \
+                 WHERE c.ts >= ?1 AND c.bot = 0 GROUP BY l.id ORDER BY n DESC LIMIT 10",
+            )
+            .bind(&binds)?,
+        );
+        stmts.push(d.prepare("SELECT COUNT(*) AS n FROM links"));
+    }
+    let res = d.batch(stmts).await?;
 
     #[derive(Deserialize)]
     struct Totals {
@@ -455,42 +438,14 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
         bots: Option<i64>,
         qr: Option<i64>,
     }
-    let totals = d
-        .prepare(format!(
-            "SELECT SUM(CASE WHEN bot = 0 THEN 1 ELSE 0 END) AS humans, SUM(bot) AS bots, SUM(CASE WHEN bot = 0 THEN qr ELSE 0 END) AS qr FROM clicks WHERE {filter}"
-        ))
-        .bind(&base)?
-        .first::<Totals>(None)
-        .await?;
-
-    binds.insert(0, n(bucket));
-    let series = d
-        .prepare(format!(
-            "SELECT CAST(ts / ?1 AS INTEGER) * ?1 AS t, COUNT(*) AS n FROM clicks WHERE {} AND bot = 0 GROUP BY t ORDER BY t",
-            // Shift placeholders by one because ?1 is the bucket size.
-            if link.is_some() { "link_id = ?2 AND ts >= ?3" } else { "ts >= ?2" }
-        ))
-        .bind(&binds)?
-        .all()
-        .await?
-        .results::<Bucket>()?;
-
+    let totals = res[0].results::<Totals>()?.into_iter().next();
     let mut dims = serde_json::Map::new();
-    for col in ["country", "referrer", "device", "os", "browser", "city"] {
-        let rows = d
-            .prepare(format!(
-                "SELECT {col} AS k, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0 GROUP BY {col} ORDER BY n DESC LIMIT 10"
-            ))
-            .bind(&base)?
-            .all()
-            .await?
-            .results::<KV>()?;
+    for (i, col) in DIMENSIONS.iter().enumerate() {
         dims.insert(
             col.to_string(),
-            serde_json::to_value(rows).unwrap_or_default(),
+            serde_json::to_value(res[2 + i].results::<KV>()?).unwrap_or_default(),
         );
     }
-
     let mut out = serde_json::json!({
         "range": r,
         "bucket_ms": bucket,
@@ -498,89 +453,52 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
         "clicks": totals.as_ref().and_then(|t| t.humans).unwrap_or(0),
         "bots": totals.as_ref().and_then(|t| t.bots).unwrap_or(0),
         "qr": totals.as_ref().and_then(|t| t.qr).unwrap_or(0),
-        "series": series,
+        "series": res[1].results::<Bucket>()?,
         "top": dims,
     });
-
     if link.is_none() {
-        #[derive(Deserialize, Serialize)]
-        struct TopLink {
-            id: i64,
-            slug: String,
-            url: String,
-            title: Option<String>,
-            n: i64,
-        }
-        let top = d
-            .prepare(
-                "SELECT l.id, l.slug, l.url, l.title, COUNT(*) AS n FROM clicks c JOIN links l ON l.id = c.link_id \
-                 WHERE c.ts >= ? AND c.bot = 0 GROUP BY l.id ORDER BY n DESC LIMIT 10",
-            )
-            .bind(&[n(since)])?
-            .all()
-            .await?
-            .results::<TopLink>()?;
-        let links = d
-            .prepare("SELECT COUNT(*) AS n FROM links")
-            .first::<Count>(None)
-            .await?
+        out["top_links"] = serde_json::Value::Array(res[8].results::<serde_json::Value>()?);
+        out["links"] = res[9]
+            .results::<CountRow>()?
+            .first()
             .map(|c| c.n)
-            .unwrap_or(0);
-        out["top_links"] = serde_json::to_value(top).unwrap_or_default();
-        out["links"] = links.into();
+            .unwrap_or(0)
+            .into();
     }
     json(&out, 200)
 }
 
-// ---- Export ----
+// ---- Export / maintenance ----
 
-async fn all_links(env: &Env) -> Result<Vec<Link>> {
-    let d = store::db(env)?;
-    let mut out = vec![];
-    let mut offset = 0;
-    loop {
-        let rows = d
-            .prepare("SELECT id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at FROM links ORDER BY id LIMIT 1000 OFFSET ?")
-            .bind(&[n(offset)])?
-            .all()
-            .await?
-            .results::<LinkRow>()?;
-        let len = rows.len();
-        out.extend(rows.into_iter().map(Link::from));
-        if len < 1000 {
-            break;
-        }
-        offset += 1000;
-    }
-    Ok(out)
-}
-
-fn iso(ms: i64) -> String {
-    js_date_iso(ms)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn js_date_iso(ms: i64) -> String {
-    js_sys::Date::new(&JsValue::from_f64(ms as f64))
-        .to_iso_string()
-        .into()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn js_date_iso(ms: i64) -> String {
-    ms.to_string()
+/// One page of links (with aliases) after `after_id`, ordered by id (keyset paging).
+async fn links_after(env: &Env, after_id: i64, limit: i64) -> Result<Vec<Link>> {
+    let page = store::query_links(
+        env,
+        &format!("WHERE id > ?1 ORDER BY id LIMIT {limit}"),
+        &[n(after_id)],
+    )
+    .await?;
+    store::with_aliases(env, page).await
 }
 
 async fn export(env: &Env, format: &str) -> Result<Response> {
-    let links = all_links(env).await?;
-    let (body, ctype, ext) = if format == "json" {
+    let mut links = vec![];
+    loop {
+        let page = links_after(env, links.last().map(|l: &Link| l.id).unwrap_or(0), 1000).await?;
+        let done = page.len() < 1000;
+        links.extend(page);
+        if done {
+            break;
+        }
+    }
+    let (content, ctype, ext) = if format == "json" {
         (
             serde_json::to_string_pretty(&links).unwrap_or_default(),
             "application/json",
             "json",
         )
     } else {
-        let mut csv = String::from("slug,url,title,tags,notes,redirect_type,disabled,expires_at,clicks,created_at,source\n");
+        let mut csv = String::from("slug,url,title,tags,notes,redirect_type,disabled,expires_at,clicks,created_at,source,aliases\n");
         for l in &links {
             let row = [
                 csv_field(&l.slug),
@@ -594,51 +512,32 @@ async fn export(env: &Env, format: &str) -> Result<Response> {
                 l.clicks.to_string(),
                 iso(l.created_at),
                 csv_field(&l.source),
+                csv_field(&l.aliases.join(";")),
             ];
             csv.push_str(&row.join(","));
             csv.push('\n');
         }
         (csv, "text/csv; charset=utf-8", "csv")
     };
-    let mut res = Response::ok(body)?;
-    let h = res.headers_mut();
-    h.set("Content-Type", ctype)?;
-    h.set(
+    let mut res = util::body(content, ctype)?;
+    res.headers_mut().set(
         "Content-Disposition",
         &format!("attachment; filename=\"301-links.{ext}\""),
     )?;
-    h.set("Cache-Control", "no-store")?;
     Ok(res)
 }
 
-async fn rebuild_kv(env: &Env, offset: i64) -> Result<Response> {
-    const PAGE: i64 = 40;
-    let rows = store::db(env)?
-        .prepare("SELECT id FROM links ORDER BY id LIMIT ? OFFSET ?")
-        .bind(&[n(PAGE), n(offset)])?
-        .all()
-        .await?
-        .results::<serde_json::Value>()?;
-    let mut written = 0;
-    for r in &rows {
-        if let Some(id) = r
-            .get("id")
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-        {
-            if let Some(l) = store::get_link(env, id).await? {
-                if store::write_kv(env, &l).await.is_ok() {
-                    written += 1;
-                }
-            }
-        }
-    }
-    let next = if rows.len() as i64 == PAGE {
-        Some(offset + PAGE)
-    } else {
-        None
-    };
+async fn rebuild_kv(env: &Env, after: i64) -> Result<Response> {
+    const PAGE: i64 = 100;
+    let links = links_after(env, after, PAGE).await?;
+    let results =
+        futures_util::future::join_all(links.iter().map(|l| store::sync_kv(env, l))).await;
+    let written = results.iter().filter(|r| r.is_ok()).count();
+    let next = (links.len() as i64 == PAGE)
+        .then(|| links.last().map(|l| l.id))
+        .flatten();
     json(
-        &serde_json::json!({ "written": written, "next_offset": next }),
+        &serde_json::json!({ "written": written, "next_after": next }),
         200,
     )
 }

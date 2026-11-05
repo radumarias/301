@@ -3,10 +3,11 @@
 //! Provider fetches are page-at-a-time so the browser drives pagination and no single
 //! Worker request runs into the subrequest limit. Tokens are never stored.
 
-use crate::model::{normalize_tags, validate_url, Link};
-use crate::slug::{self, Style};
-use crate::store::{self, n, s, SResult, StoreError};
+use crate::model::{Link, LinkInput};
+use crate::slug;
+use crate::store::{self, s, SResult, StoreError};
 use crate::util::now_ms;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -105,31 +106,9 @@ pub fn parse_date(v: &Value) -> Option<i64> {
                 f as i64
             }
         }),
-        Value::String(s) if !s.is_empty() => date_str(s),
+        Value::String(s) if !s.is_empty() => crate::util::parse_date_str(s),
         _ => None,
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn date_str(s: &str) -> Option<i64> {
-    // JS accepts "+0000" offsets poorly; normalise to "+00:00".
-    let fixed =
-        if s.len() > 5 && s.as_bytes()[s.len() - 5] == b'+' && !s[s.len() - 4..].contains(':') {
-            format!("{}:{}", &s[..s.len() - 2], &s[s.len() - 2..])
-        } else {
-            s.to_string()
-        };
-    let t = js_sys::Date::parse(&fixed);
-    if t.is_nan() {
-        None
-    } else {
-        Some(t as i64)
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn date_str(_s: &str) -> Option<i64> {
-    None
 }
 
 fn path_of(u: &str) -> Option<String> {
@@ -211,21 +190,20 @@ pub fn bitly_row(l: &Value) -> Option<ImportRow> {
 }
 
 async fn rebrandly(token: &str, domain: Option<&str>, cursor: Option<&str>) -> R<FetchPage> {
-    let mut url =
-        "https://api.rebrandly.com/v1/links?limit=25&orderBy=createdAt&orderDir=desc".to_string();
+    let mut params = vec![
+        ("limit", "25"),
+        ("orderBy", "createdAt"),
+        ("orderDir", "desc"),
+    ];
     if let Some(c) = cursor {
-        if !c.chars().all(|ch| ch.is_ascii_alphanumeric()) {
-            return Err("bad cursor".into());
-        }
-        url.push_str(&format!("&last={c}"));
+        params.push(("last", c));
     }
     if let Some(d) = domain.map(str::trim).filter(|d| !d.is_empty()) {
-        url.push_str(&format!(
-            "&domain.fullName={}",
-            percent_encoding::utf8_percent_encode(d, percent_encoding::NON_ALPHANUMERIC)
-        ));
+        params.push(("domain.fullName", d));
     }
-    let body = get_json(&url, &[("apikey", token.to_string())]).await?;
+    let url = url::Url::parse_with_params("https://api.rebrandly.com/v1/links", &params)
+        .map_err(|e| e.to_string())?;
+    let body = get_json(url.as_str(), &[("apikey", token.to_string())]).await?;
     let links = body.as_array().cloned().unwrap_or_default();
     let rows = links.iter().filter_map(rebrandly_row).collect();
     let next = if links.len() == 25 {
@@ -278,14 +256,13 @@ async fn shortio(token: &str, domain: Option<&str>, cursor: Option<&str>) -> R<F
     if !domain_id.chars().all(|c| c.is_ascii_digit()) {
         return Err("bad domain id".into());
     }
-    let mut url = format!("https://api.short.io/api/links?domain_id={domain_id}&limit=150");
+    let mut params = vec![("domain_id", domain_id.as_str()), ("limit", "150")];
     if let Some(t) = &page_token {
-        url.push_str(&format!(
-            "&pageToken={}",
-            percent_encoding::utf8_percent_encode(t, percent_encoding::NON_ALPHANUMERIC)
-        ));
+        params.push(("pageToken", t));
     }
-    let body = get_json(&url, &auth).await?;
+    let url = url::Url::parse_with_params("https://api.short.io/api/links", &params)
+        .map_err(|e| e.to_string())?;
+    let body = get_json(url.as_str(), &auth).await?;
     let rows = body
         .get("links")
         .and_then(Value::as_array)
@@ -335,48 +312,45 @@ async fn tinyurl(token: &str, cursor: Option<&str>) -> R<FetchPage> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut rows = vec![];
-    for item in items.iter().skip(start).take(PER_PAGE) {
-        let (Some(domain), Some(alias)) = (str_of(item, "domain"), str_of(item, "alias")) else {
-            continue;
-        };
-        let enc = |s: &str| {
-            percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
-        };
-        let detail = get_json(
-            &format!(
-                "https://api.tinyurl.com/alias/{}/{}",
-                enc(&domain),
-                enc(&alias)
-            ),
-            &auth,
-        )
-        .await;
-        let data = detail
-            .as_ref()
-            .ok()
-            .and_then(|d| d.get("data"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        match str_of(&data, "url") {
-            Some(url) => rows.push(ImportRow {
+    let page: Vec<(&Value, String, String)> = items
+        .iter()
+        .skip(start)
+        .take(PER_PAGE)
+        .filter_map(|item| Some((item, str_of(item, "domain")?, str_of(item, "alias")?)))
+        .collect();
+    // The list has no long URLs: fetch each link's detail, concurrently.
+    let details = join_all(page.iter().map(|(_, domain, alias)| {
+        let mut u = url::Url::parse("https://api.tinyurl.com/alias/").expect("static url");
+        u.path_segments_mut()
+            .expect("base")
+            .pop_if_empty()
+            .push(domain)
+            .push(alias);
+        let auth = &auth;
+        async move { get_json(u.as_str(), auth).await }
+    }))
+    .await;
+    let rows = page
+        .into_iter()
+        .zip(details)
+        .map(|((item, domain, alias), detail)| {
+            let url = detail
+                .ok()
+                .and_then(|d| d.get("data").and_then(|v| str_of(v, "url")));
+            ImportRow {
+                warning: url
+                    .is_none()
+                    .then(|| format!("could not read the long URL for {domain}/{alias}")),
                 slug: Some(alias),
-                url,
+                url: url.unwrap_or_default(),
                 tags: tags_of(item, "tags"),
                 expires_at: item.get("expires_at").and_then(parse_date),
                 created_at: item.get("created_at").and_then(parse_date),
                 source: Some("tinyurl".into()),
                 ..Default::default()
-            }),
-            None => rows.push(ImportRow {
-                slug: Some(alias.clone()),
-                url: String::new(),
-                source: Some("tinyurl".into()),
-                warning: Some(format!("could not read the long URL for {domain}/{alias}")),
-                ..Default::default()
-            }),
-        }
-    }
+            }
+        })
+        .collect();
     let next = (start + PER_PAGE < items.len()).then(|| (start + PER_PAGE).to_string());
     Ok(FetchPage {
         rows,
@@ -408,6 +382,22 @@ pub struct CommitResult {
     pub renamed: Vec<Value>,
 }
 
+impl ImportRow {
+    /// The fields an import sets, as a regular link input (same validation as the form).
+    fn to_input(&self, extra_tags: &[String]) -> LinkInput {
+        LinkInput {
+            url: Some(self.url.clone()),
+            title: self.title.clone().map(Some),
+            notes: self.notes.clone().map(Some),
+            add_tags: Some(self.tags.iter().chain(extra_tags).cloned().collect()),
+            expires_at: Some(self.expires_at),
+            disabled: Some(self.disabled),
+            source: Some(self.source.clone().unwrap_or_else(|| "csv".into())),
+            ..Default::default()
+        }
+    }
+}
+
 async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
     #[derive(Deserialize)]
     struct Row {
@@ -415,20 +405,23 @@ async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
         id: i64,
     }
     let d = store::db(env)?;
-    let mut out = HashMap::new();
+    let mut stmts = vec![];
     for chunk in slugs.chunks(40) {
         let marks = vec!["?"; chunk.len()].join(",");
-        let mut binds: Vec<_> = chunk.iter().map(|c| s(c)).collect();
-        binds.extend(chunk.iter().map(|c| s(c)));
-        let rows = d
-            .prepare(format!(
+        let binds: Vec<_> = chunk.iter().chain(chunk).map(|c| s(c)).collect();
+        stmts.push(
+            d.prepare(format!(
                 "SELECT slug, id FROM links WHERE slug IN ({marks}) UNION ALL SELECT slug, link_id AS id FROM aliases WHERE slug IN ({marks})"
             ))
-            .bind(&binds)?
-            .all()
-            .await?
-            .results::<Row>()?;
-        out.extend(rows.into_iter().map(|r| (r.slug, r.id)));
+            .bind(&binds)?,
+        );
+    }
+    let mut out = HashMap::new();
+    if stmts.is_empty() {
+        return Ok(out);
+    }
+    for res in d.batch(stmts).await? {
+        out.extend(res.results::<Row>()?.into_iter().map(|r| (r.slug, r.id)));
     }
     Ok(out)
 }
@@ -446,54 +439,35 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
     }
     let st = store::settings(env).await.unwrap_or_default();
     let mut result = CommitResult::default();
-    let given: Vec<String> = req
+    let slugs: Vec<Option<String>> = req
         .rows
         .iter()
-        .filter_map(|r| r.slug.clone())
-        .map(|s| s.trim().trim_matches('/').to_string())
+        .map(|r| r.slug.as_deref().and_then(slug::normalize))
         .collect();
-    let existing = taken(env, &given).await?;
+    let existing = taken(env, &slugs.iter().flatten().cloned().collect::<Vec<_>>()).await?;
     let mut seen: HashSet<String> = HashSet::new();
     let d = store::db(env)?;
     let mut stmts = vec![];
-    let mut kv_deletes = vec![];
+    let mut overwritten: Vec<Link> = vec![];
     let now = now_ms();
 
-    for (i, row) in req.rows.into_iter().enumerate() {
-        let url = row.url.trim().to_string();
-        if let Err(e) = validate_url(&url) {
+    for (i, (row, slug_n)) in req.rows.iter().zip(slugs).enumerate() {
+        let mut fail = |slug: Option<&str>, e: String| {
             result
                 .errors
-                .push(serde_json::json!({ "row": i, "slug": row.slug, "error": e }));
-            continue;
-        }
-        let mut slug_v = match row
-            .slug
-            .as_deref()
-            .map(|s| s.trim().trim_matches('/'))
-            .filter(|s| !s.is_empty())
-        {
-            Some(sl) => {
-                if let Err(e) = slug::validate(sl) {
-                    result
-                        .errors
-                        .push(serde_json::json!({ "row": i, "slug": sl, "error": e }));
+                .push(serde_json::json!({ "row": i, "slug": slug, "error": e }))
+        };
+        let input = row.to_input(&req.tags);
+        let mut slug_v = match slug_n {
+            Some(sl) => match slug::validate(&sl) {
+                Ok(()) => sl,
+                Err(e) => {
+                    fail(Some(&sl), e);
                     continue;
                 }
-                sl.to_string()
-            }
-            None => {
-                store::unique_slug(
-                    env,
-                    Style::parse(&st.default_slug_style),
-                    st.default_slug_length,
-                )
-                .await?
-            }
+            },
+            None => store::unique_slug(env, st.slug_style(), st.default_slug_length).await?,
         };
-        let mut tags = row.tags.clone();
-        tags.extend(req.tags.iter().cloned());
-        let tags = normalize_tags(tags);
         let conflict = existing.get(&slug_v).copied();
         let dup = seen.contains(&slug_v);
 
@@ -504,27 +478,23 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                     continue;
                 }
                 "overwrite" if !dup => {
-                    let id = conflict.unwrap_or_default();
-                    stmts.push(
-                        d.prepare("UPDATE links SET url = ?2, title = COALESCE(?3, title), tags = ?4, notes = COALESCE(?5, notes), expires_at = ?6, disabled = ?7, updated_at = ?8 WHERE id = ?1")
-                            .bind(&[
-                                n(id),
-                                s(&url),
-                                store::os(&row.title),
-                                s(&serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into())),
-                                store::os(&row.notes),
-                                store::on(row.expires_at),
-                                n(row.disabled as i64),
-                                n(now),
-                            ])?,
-                    );
-                    kv_deletes.push(slug_v.clone());
-                    seen.insert(slug_v);
-                    result.updated += 1;
+                    // Same write path as an edit in the admin UI.
+                    let Some(mut link) = store::get_link(env, conflict.unwrap_or_default()).await?
+                    else {
+                        continue;
+                    };
+                    match store::prepare_update(env, &mut link, &input).await {
+                        Ok(st) => {
+                            stmts.extend(st);
+                            seen.insert(slug_v);
+                            overwritten.push(link);
+                            result.updated += 1;
+                        }
+                        Err(e) => fail(Some(&slug_v), e.public_message()),
+                    }
                     continue;
                 }
                 _ => {
-                    // rename (or a duplicate inside this import under overwrite)
                     let base = slug_v.clone();
                     let mut found = None;
                     for k in 2..50 {
@@ -538,7 +508,7 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                         }
                     }
                     let Some(newslug) = found else {
-                        result.errors.push(serde_json::json!({ "row": i, "slug": base, "error": "no free renamed slug" }));
+                        fail(Some(&base), "no free renamed slug".into());
                         continue;
                     };
                     result
@@ -549,28 +519,15 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
             }
         }
 
-        let link = Link {
-            slug: slug_v.clone(),
-            url,
-            title: row.title.clone().filter(|t| !t.trim().is_empty()),
-            notes: row.notes.clone().filter(|t| !t.trim().is_empty()),
-            tags,
-            redirect_type: st.default_redirect,
-            disabled: row.disabled,
-            expires_at: row.expires_at,
-            passthrough: true,
-            source: row.source.clone().unwrap_or_else(|| "csv".into()),
-            created_at: row.created_at.unwrap_or(now),
-            updated_at: now,
-            ..Default::default()
-        };
-        if let Err(e) = crate::model::validate_link(&link) {
-            result
-                .errors
-                .push(serde_json::json!({ "row": i, "slug": slug_v, "error": e }));
+        let mut link = Link::new(st.default_redirect, "csv");
+        if let Err(e) = input.apply(&mut link) {
+            fail(Some(&slug_v), e);
             continue;
         }
-        stmts.push(store::insert_statement(&d, &link)?);
+        link.slug = slug_v.clone();
+        link.created_at = row.created_at.unwrap_or(now);
+        link.updated_at = now;
+        stmts.push(store::insert_stmt(&d, &link)?);
         seen.insert(slug_v);
         result.created += 1;
     }
@@ -578,10 +535,9 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
     for chunk in stmts.chunks(50) {
         d.batch(chunk.to_vec()).await?;
     }
-    // Overwritten links: drop their KV record so the next click refills it from D1.
-    let kvs = store::kv(env)?;
-    for sl in kv_deletes {
-        let _ = kvs.delete(&store::kv_key(&sl)).await;
+    // New links get their KV record on first click; overwritten ones are refreshed now.
+    for link in &overwritten {
+        store::sync_kv(env, link).await?;
     }
     Ok(result)
 }

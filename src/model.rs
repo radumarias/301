@@ -52,6 +52,14 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn map(&self, f: impl Fn(&str) -> String) -> Device {
+        Device {
+            ios: self.ios.as_deref().map(&f),
+            android: self.android.as_deref().map(&f),
+            desktop: self.desktop.as_deref().map(&f),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ios.is_none() && self.android.is_none() && self.desktop.is_none()
     }
@@ -85,6 +93,39 @@ pub struct Link {
     pub updated_at: i64,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// `active`, `disabled` or `expired`, computed when read.
+    #[serde(default, skip_deserializing)]
+    pub status: &'static str,
+}
+
+impl Link {
+    /// A new, unsaved link with the configured defaults.
+    pub fn new(default_redirect: u16, source: &str) -> Self {
+        Link {
+            redirect_type: default_redirect,
+            passthrough: true,
+            source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_status(mut self) -> Self {
+        self.status = self.status(crate::util::now_ms());
+        self
+    }
+
+    /// Whether visitors can currently follow the link.
+    pub fn status(&self, now: i64) -> &'static str {
+        if self.disabled {
+            "disabled"
+        } else if self.expires_at.is_some_and(|e| now >= e)
+            || self.max_clicks.is_some_and(|m| self.clicks >= m)
+        {
+            "expired"
+        } else {
+            "active"
+        }
+    }
 }
 
 /// Raw D1 row.
@@ -145,7 +186,9 @@ impl From<LinkRow> for Link {
             created_at: r.created_at,
             updated_at: r.updated_at,
             aliases: vec![],
+            status: "",
         }
+        .with_status()
     }
 }
 
@@ -185,10 +228,26 @@ pub struct LinkInput {
     pub geo: Option<BTreeMap<String, String>>,
     pub device: Option<Device>,
     pub source: Option<String>,
+    /// Tags merged into the existing ones (bulk actions, imports).
+    #[serde(default)]
+    pub add_tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub remove_tags: Option<Vec<String>>,
 }
 
-fn clean(s: Option<String>) -> Option<String> {
+pub fn clean(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// HTTP status codes a link (or the settings default) may redirect with.
+pub const REDIRECT_TYPES: [u16; 4] = [301, 302, 307, 308];
+
+pub fn validate_redirect_type(t: u16) -> Result<(), String> {
+    if REDIRECT_TYPES.contains(&t) {
+        Ok(())
+    } else {
+        Err("redirect type must be 301, 302, 307 or 308".into())
+    }
 }
 
 pub fn validate_url(u: &str) -> Result<(), String> {
@@ -273,6 +332,13 @@ impl LinkInput {
                 desktop: clean(d.desktop.clone()),
             };
         }
+        if let Some(t) = &self.add_tags {
+            link.tags = normalize_tags(link.tags.iter().chain(t).cloned().collect());
+        }
+        if let Some(t) = &self.remove_tags {
+            let rm = normalize_tags(t.clone());
+            link.tags.retain(|x| !rm.contains(x));
+        }
         if let Some(s) = &self.source {
             link.source = s.clone();
         }
@@ -282,9 +348,7 @@ impl LinkInput {
 
 pub fn validate_link(link: &Link) -> Result<(), String> {
     validate_url(&link.url)?;
-    if ![301, 302, 307, 308].contains(&link.redirect_type) {
-        return Err("redirect_type must be 301, 302, 307 or 308".into());
-    }
+    validate_redirect_type(link.redirect_type)?;
     if let Some(f) = &link.fallback_url {
         validate_url(f)?;
     }
@@ -410,11 +474,7 @@ impl KvRecord {
                 .iter()
                 .map(|(k, v)| (k.clone(), apply_utm(v, &l.utm)))
                 .collect(),
-            device: Device {
-                ios: l.device.ios.as_deref().map(|u| apply_utm(u, &l.utm)),
-                android: l.device.android.as_deref().map(|u| apply_utm(u, &l.utm)),
-                desktop: l.device.desktop.as_deref().map(|u| apply_utm(u, &l.utm)),
-            },
+            device: l.device.map(|u| apply_utm(u, &l.utm)),
             passthrough: l.passthrough,
         }
     }
@@ -540,6 +600,34 @@ mod tests {
         l.title = Some("keep".into());
         input.apply(&mut l).unwrap();
         assert_eq!(l.title.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn status_and_tag_ops() {
+        let mut l = Link {
+            url: "https://ok.com".into(),
+            redirect_type: 302,
+            tags: vec!["a".into()],
+            ..Default::default()
+        };
+        assert_eq!(l.status(10), "active");
+        l.max_clicks = Some(2);
+        l.clicks = 2;
+        assert_eq!(l.status(10), "expired");
+        l.disabled = true;
+        assert_eq!(l.status(10), "disabled");
+        let add = LinkInput {
+            add_tags: Some(vec![" B ".into(), "a".into()]),
+            ..Default::default()
+        };
+        add.apply(&mut l).unwrap();
+        assert_eq!(l.tags, vec!["a", "b"]);
+        let rm = LinkInput {
+            remove_tags: Some(vec!["A".into()]),
+            ..Default::default()
+        };
+        rm.apply(&mut l).unwrap();
+        assert_eq!(l.tags, vec!["b"]);
     }
 
     #[test]

@@ -50,7 +50,7 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         None => (slug, false),
     };
 
-    let Some(rec) = store::lookup(&env, &slug).await? else {
+    let Some((rec, needs_fill)) = store::lookup(&env, &slug).await? else {
         let st = store::settings_cached(&env).await;
         return match st.not_found_url {
             Some(u) => util::redirect(&u, 302),
@@ -108,6 +108,14 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
 
     if preview {
         return pages::preview(&slug, &dest);
+    }
+
+    if needs_fill {
+        // Read-through: cache the D1 record in KV after the response is sent.
+        let (fill_env, fill_slug, fill_rec) = (env.clone(), slug.clone(), rec.clone());
+        ctx.wait_until(async move {
+            let _ = store::fill_kv(&fill_env, &fill_slug, &fill_rec).await;
+        });
     }
 
     let qr = url.query_pairs().any(|(k, _)| k == "qr");
