@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>301 admin</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/_/app.css">
+  <script src="/_/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#/"><span class="logo">301</span><span class="brand-name">xorio.rs</span></a>
+    <nav id="nav">
+      <a href="#/" data-nav="dash">Dashboard</a>
+      <a href="#/links" data-nav="links">Links</a>
+      <a href="#/import" data-nav="import">Import</a>
+      <a href="#/settings" data-nav="settings">Settings</a>
+    </nav>
+    <div class="top-right">
+      <button class="btn primary" id="new-link" title="New link (n)">New link</button>
+      <span id="me" class="muted small"></span>
+    </div>
+  </header>
+  <main id="app"><p class="muted">Loading…</p></main>
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

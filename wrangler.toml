@@ -1,0 +1,32 @@
+name = "xorio-301"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = false
+routes = [{ pattern = "301.xorio.rs", custom_domain = true }]
+
+[build]
+command = "cargo install -q worker-build@^0.8 && worker-build --release"
+watch_dir = ["src", "ui", "migrations"]
+
+[observability]
+enabled = true
+
+# ids are filled in by scripts/provision.sh
+[[kv_namespaces]]
+binding = "LINKS"
+id = "REPLACE_KV_ID"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "xorio-301"
+database_id = "REPLACE_D1_ID"
+migrations_dir = "migrations"
+
+[vars]
+# Set by scripts/provision.sh from the Cloudflare Access application.
+ACCESS_TEAM_DOMAIN = ""
+ACCESS_AUD = ""
+# Comma-separated emails allowed into the admin.
+ADMIN_EMAILS = ""
+# Comma-separated Access service token client IDs (common_name) allowed into the API.
+ADMIN_SERVICE_TOKENS = ""
