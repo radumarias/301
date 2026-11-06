@@ -180,7 +180,8 @@ pub fn stats_sql(
     }
     if link.is_none() {
         q.push(format!(
-            "SELECT index1 AS k, SUM(_sample_interval) AS n FROM {ds} WHERE {f} AND double1 = 0 GROUP BY k ORDER BY n DESC LIMIT 10"
+            // 20, not 10: ids of deleted links (AE rows cannot be deleted) are dropped later.
+            "SELECT index1 AS k, SUM(_sample_interval) AS n FROM {ds} WHERE {f} AND double1 = 0 GROUP BY k ORDER BY n DESC LIMIT 20"
         ));
     }
     q

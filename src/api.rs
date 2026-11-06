@@ -529,10 +529,10 @@ impl Agg {
     }
 }
 
-fn top10<K: Clone + Ord>(m: &HashMap<K, i64>) -> Vec<(K, i64)> {
+fn top_n<K: Clone + Ord>(m: &HashMap<K, i64>, n: usize) -> Vec<(K, i64)> {
     let mut v: Vec<(K, i64)> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    v.truncate(10);
+    v.truncate(n);
     v
 }
 
@@ -702,7 +702,7 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
 
     let mut dims = serde_json::Map::new();
     for (col, m) in &agg.dims {
-        let rows: Vec<KV> = top10(m).into_iter().map(|(k, n)| KV { k, n }).collect();
+        let rows: Vec<KV> = top_n(m, 10).into_iter().map(|(k, n)| KV { k, n }).collect();
         dims.insert(col.clone(), serde_json::to_value(rows).unwrap_or_default());
     }
     let series: Vec<Bucket> = agg
@@ -723,7 +723,8 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
         "analytics_error": analytics_error,
     });
     if link.is_none() {
-        let top = top10(&agg.top_links);
+        // Extra candidates: deleted links (still in Analytics Engine) are skipped below.
+        let top = top_n(&agg.top_links, 20);
         let mut info: HashMap<i64, serde_json::Value> = HashMap::new();
         if !top.is_empty() {
             let marks = vec!["?"; top.len()].join(",");
@@ -750,6 +751,7 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
                     row
                 })
             })
+            .take(10)
             .collect::<Vec<_>>()
             .into();
         let d = store::db(env)?;

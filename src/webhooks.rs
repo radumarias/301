@@ -193,27 +193,28 @@ async fn record(env: &Env, outcomes: &[(i64, i64, Option<String>)]) -> worker::R
     Ok(())
 }
 
-/// Sends a link event (`link.created` ...) for each link, with one hook lookup and
-/// one status write for the whole set. Call it from `wait_until`.
-pub async fn fire_links(env: &Env, event: &str, links: Vec<Value>) {
+/// Sends a link event (`link.created` ...) with one delivery per hook: `data` is the
+/// link for single changes and an array of links for bulk actions, so a 200-link bulk
+/// action stays within the subrequest limit. Call it from `wait_until`.
+pub async fn fire_links(env: &Env, event: &str, mut links: Vec<Value>) {
     let hooks = list(env).await.unwrap_or_default();
-    if !hooks.iter().any(|h| h.wants(event)) {
+    if links.is_empty() || !hooks.iter().any(|h| h.wants(event)) {
         return;
     }
-    let mut outcomes = vec![];
-    for data in &links {
-        outcomes.extend(deliver_all(&hooks, event, data).await);
-    }
-    // Keep the last outcome per hook.
-    outcomes.reverse();
-    outcomes.dedup_by_key(|o| o.0);
+    let data = if links.len() == 1 {
+        links.remove(0)
+    } else {
+        Value::Array(links)
+    };
+    let outcomes = deliver_all(&hooks, event, &data).await;
     if let Err(e) = record(env, &outcomes).await {
         worker::console_error!("webhook status write failed: {e}");
     }
 }
 
-/// Sends a `click` event. Hooks come from the in-isolate cache, and only failures
-/// are stored, so a busy link does not turn every click back into a D1 write.
+/// Sends a `click` event. Hooks come from the in-isolate cache, and only failures (and
+/// the first success after one) are stored, so a busy link does not turn every click
+/// back into a D1 write.
 pub async fn fire_click(env: &Env, click: &crate::store::Click) {
     let hooks = cached(env).await;
     if !hooks.iter().any(|h| h.wants("click")) {
@@ -224,7 +225,7 @@ pub async fn fire_click(env: &Env, click: &crate::store::Click) {
     let failed: Vec<_> = deliver_all(&hooks, "click", &data)
         .await
         .into_iter()
-        .filter(|o| o.2.is_some())
+        .filter(|o| o.2.is_some() || hooks.iter().any(|h| h.id == o.0 && h.last_error.is_some()))
         .collect();
     let _ = record(env, &failed).await;
 }

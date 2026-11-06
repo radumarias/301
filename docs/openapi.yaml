@@ -349,6 +349,8 @@ components:
       description: |
         Deliveries are POSTs of {"event", "at", "data"} with headers X-301-Event and
         X-301-Signature: sha256=<hex HMAC-SHA256 of the raw body using the secret>.
+        For link events `data` is the link, or an array of links for bulk actions;
+        for `click` it is the click (link id and slug, country, device, referrer...).
       properties:
         id: { type: integer }
         url: { type: string }

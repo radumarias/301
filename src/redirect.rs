@@ -161,7 +161,14 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         }
     }
 
-    let roll = || crate::crypto::random_bytes(1)[0] % 100;
+    // Rejection sampling: 256 is not a multiple of 100, so a plain `% 100` would favour
+    // rolls 0..56 and skew the split towards the variants.
+    let roll = || loop {
+        let b = crate::crypto::random_bytes(1)[0];
+        if b < 200 {
+            break b % 100;
+        }
+    };
     let (picked, split) = rec.destination(info.os, info.device, country.as_deref(), roll);
     let variant = split.then(|| picked.to_string());
     let dest = if rec.passthrough {
@@ -242,7 +249,14 @@ fn first_resync(id: i64, now: i64) -> bool {
     RESYNCED.with(|m| {
         let mut m = m.borrow_mut();
         m.retain(|_, at| now - *at < 60_000);
-        m.insert(id, now).is_none()
+        // Keep the first time: refreshing it on every hit would never let it expire.
+        match m.entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
+        }
     })
 }
 

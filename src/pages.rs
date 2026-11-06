@@ -136,6 +136,8 @@ pub fn social_card(og: &crate::model::Og, dest: Option<&str>) -> Result<Response
     let mut res = Response::from_html(html)?;
     let h = res.headers_mut();
     h.set("Cache-Control", "public, max-age=300")?;
+    // Same URL as the redirect: shared caches must not hand the card to people.
+    h.set("Vary", "User-Agent")?;
     h.set("X-Robots-Tag", "noindex")?;
     h.set("Content-Security-Policy", "default-src 'none'; img-src *")?;
     Ok(res)

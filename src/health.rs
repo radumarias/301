@@ -1,7 +1,7 @@
 //! Broken-link checker: a cron job re-checks every destination about once a day.
 
 use crate::model::{is_broken, Health};
-use crate::store::{self, n, on, os};
+use crate::store::{self, n, on, os, s};
 use crate::util::{self, now_ms};
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -44,10 +44,12 @@ pub async fn check_url(url: &str) -> (i64, Option<String>) {
     }
 }
 
-fn result_stmt(env: &Env, id: i64, h: &Health) -> worker::Result<D1PreparedStatement> {
+/// Only stores the result while the link still points at the checked URL, so a check
+/// racing an edit cannot attach the old destination's status to the new one.
+fn result_stmt(env: &Env, id: i64, url: &str, h: &Health) -> worker::Result<D1PreparedStatement> {
     store::db(env)?
-        .prepare("UPDATE links SET health_code = ?2, health_error = ?3, health_checked_at = ?4 WHERE id = ?1")
-        .bind(&[n(id), n(h.code), os(&h.error), on(Some(h.checked_at))])
+        .prepare("UPDATE links SET health_code = ?2, health_error = ?3, health_checked_at = ?4 WHERE id = ?1 AND url = ?5")
+        .bind(&[n(id), n(h.code), os(&h.error), on(Some(h.checked_at)), s(url)])
 }
 
 async fn check(url: &str) -> Health {
@@ -63,7 +65,7 @@ async fn check(url: &str) -> Health {
 /// Checks a link's main destination and stores the result.
 pub async fn check_link(env: &Env, id: i64, url: &str) -> worker::Result<Health> {
     let h = check(url).await;
-    result_stmt(env, id, &h)?.run().await?;
+    result_stmt(env, id, url, &h)?.run().await?;
     Ok(h)
 }
 
@@ -91,7 +93,7 @@ pub async fn run_batch(env: &Env) -> worker::Result<usize> {
     let stmts = due
         .iter()
         .zip(&results)
-        .map(|(r, h)| result_stmt(env, r.id, h))
+        .map(|(r, h)| result_stmt(env, r.id, &r.url, h))
         .collect::<worker::Result<Vec<_>>>()?;
     store::db(env)?.batch(stmts).await?;
     Ok(due.len())
