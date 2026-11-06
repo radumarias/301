@@ -1,18 +1,24 @@
-//! Cloudflare Access JWT verification for the admin UI and API.
+//! Who is calling: a Google sign-in session (cookie), a Cloudflare Access JWT (admins and
+//! service tokens, when Access is configured), or the local-dev bypass.
 //!
-//! Access protects `/_/*` and `/api/*` at the edge; the Worker verifies the
-//! `Cf-Access-Jwt-Assertion` token again so a missing or wrong Access policy
-//! fails closed instead of exposing the admin.
+//! Admins are the emails in `ADMIN_EMAILS`. Everyone else who signs in is a regular user
+//! who only sees their own links.
 
+use crate::account;
 use crate::crypto::{b64url_decode, verify_rs256};
 use crate::util::now_ms;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use worker::{Env, Fetch, Request};
 
 #[derive(Debug, Clone)]
 pub struct Identity {
+    pub user_id: i64,
     pub email: String,
+    pub name: Option<String>,
+    pub admin: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -31,9 +37,18 @@ struct Header {
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
-enum Aud {
+pub enum Aud {
     One(String),
     Many(Vec<String>),
+}
+
+impl Aud {
+    pub fn contains(&self, aud: &str) -> bool {
+        match self {
+            Aud::One(a) => a == aud,
+            Aud::Many(v) => v.iter().any(|a| a == aud),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -50,43 +65,59 @@ pub struct Claims {
 }
 
 thread_local! {
-    static JWKS: RefCell<Option<(i64, String, Vec<serde_json::Value>)>> = const { RefCell::new(None) };
+    /// JWKS by certs URL: (fetched at ms, keys).
+    static JWKS: RefCell<HashMap<String, (i64, Vec<serde_json::Value>)>> = RefCell::new(HashMap::new());
 }
 
-fn var(env: &Env, name: &str) -> String {
+pub fn var(env: &Env, name: &str) -> String {
     env.var(name)
         .map(|v| v.to_string())
+        .or_else(|_| env.secret(name).map(|v| v.to_string()))
         .unwrap_or_default()
         .trim()
         .to_string()
 }
 
-fn list(v: &str) -> Vec<String> {
+pub fn list(v: &str) -> Vec<String> {
     v.split(',')
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn token_from(req: &Request) -> Option<String> {
+pub fn is_admin(env: &Env, email: &str) -> bool {
+    list(&var(env, "ADMIN_EMAILS")).contains(&email.to_lowercase())
+}
+
+pub fn google_configured(env: &Env) -> bool {
+    !var(env, "GOOGLE_CLIENT_ID").is_empty() && !var(env, "GOOGLE_CLIENT_SECRET").is_empty()
+}
+
+fn access_configured(env: &Env) -> bool {
+    !var(env, "ACCESS_TEAM_DOMAIN").is_empty() && !var(env, "ACCESS_AUD").is_empty()
+}
+
+/// Local development only (`.dev.vars`): ignored as soon as Access or Google is configured,
+/// so it can never open a deployed Worker.
+pub fn dev_email(env: &Env) -> Option<String> {
+    let dev = var(env, "DEV_AUTH_EMAIL");
+    (!dev.is_empty() && !access_configured(env) && !google_configured(env)).then_some(dev)
+}
+
+fn access_token(req: &Request) -> Option<String> {
     if let Ok(Some(t)) = req.headers().get("Cf-Access-Jwt-Assertion") {
         return Some(t);
     }
-    let cookies = req.headers().get("Cookie").ok().flatten()?;
-    cookies
-        .split(';')
-        .filter_map(|c| c.trim().split_once('='))
-        .find(|(k, _)| *k == "CF_Authorization")
-        .map(|(_, v)| v.to_string())
+    account::cookie(req, "CF_Authorization")
 }
 
-async fn jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
+async fn jwks(url: &str) -> worker::Result<Vec<serde_json::Value>> {
     let now = now_ms();
     let cached = JWKS.with(|c| {
         c.borrow()
-            .as_ref()
-            .filter(|(at, t, _)| t == team && now - at < 3_600_000)
-            .map(|(_, _, k)| k.clone())
+            .get(url)
+            .filter(|(at, _)| now - at < 3_600_000)
+            .map(|(_, k)| k.clone())
     });
     if let Some(k) = cached {
         return Ok(k);
@@ -95,14 +126,60 @@ async fn jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
     struct Jwks {
         keys: Vec<serde_json::Value>,
     }
-    let url = format!("https://{team}/cdn-cgi/access/certs");
     let mut res = Fetch::Url(url.parse()?).send().await?;
     let body: Jwks = res.json().await?;
-    JWKS.with(|c| *c.borrow_mut() = Some((now, team.to_string(), body.keys.clone())));
+    JWKS.with(|c| {
+        c.borrow_mut()
+            .insert(url.to_string(), (now, body.keys.clone()))
+    });
     Ok(body.keys)
 }
 
-/// Pure claim checks, separated for unit testing.
+/// Verifies an RS256 JWT against the JWKS at `certs_url` and returns its claims.
+/// Claim checks (issuer, audience, expiry) are the caller's job.
+pub async fn verify_jwt<T: DeserializeOwned>(token: &str, certs_url: &str) -> Result<T, AuthError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AuthError::Denied("malformed token".into()));
+    }
+    let header: Header = b64url_decode(parts[0])
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| AuthError::Denied("bad token header".into()))?;
+    if header.alg != "RS256" {
+        return Err(AuthError::Denied("unexpected token algorithm".into()));
+    }
+    let claims: T = b64url_decode(parts[1])
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| AuthError::Denied("bad token payload".into()))?;
+    let sig =
+        b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
+
+    let keys = jwks(certs_url)
+        .await
+        .map_err(|e| AuthError::Denied(format!("could not fetch signing keys: {e}")))?;
+    let candidates: Vec<&serde_json::Value> = keys
+        .iter()
+        .filter(|k| match &header.kid {
+            Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid.as_str()),
+            None => true,
+        })
+        .collect();
+    let signed = format!("{}.{}", parts[0], parts[1]);
+    for k in candidates {
+        if verify_rs256(k, signed.as_bytes(), &sig)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(claims);
+        }
+    }
+    // Keys may have rotated: drop the cache so the next request refetches.
+    JWKS.with(|c| c.borrow_mut().remove(certs_url));
+    Err(AuthError::Denied("invalid token signature".into()))
+}
+
+/// Pure Access claim checks, separated for unit testing. Returns the identity's email
+/// (or `service:<client id>` for a service token).
 pub fn check_claims(
     c: &Claims,
     aud: &str,
@@ -110,12 +187,8 @@ pub fn check_claims(
     now_s: i64,
     emails: &[String],
     service_tokens: &[String],
-) -> Result<Identity, AuthError> {
-    let aud_ok = match &c.aud {
-        Aud::One(a) => a == aud,
-        Aud::Many(v) => v.iter().any(|a| a == aud),
-    };
-    if !aud_ok {
+) -> Result<String, AuthError> {
+    if !c.aud.contains(aud) {
         return Err(AuthError::Denied("token audience mismatch".into()));
     }
     if c.iss.trim_end_matches('/') != format!("https://{team}") {
@@ -134,90 +207,31 @@ pub fn check_claims(
         .filter(|e| !e.is_empty())
     {
         if emails.contains(&email) {
-            return Ok(Identity { email });
+            return Ok(email);
         }
         return Err(AuthError::Denied(format!("{email} is not an admin")));
     }
     if let Some(cn) = c.common_name.as_deref().map(str::to_lowercase) {
         if service_tokens.contains(&cn) {
-            return Ok(Identity {
-                email: format!("service:{cn}"),
-            });
+            return Ok(format!("service:{cn}"));
         }
     }
     Err(AuthError::Denied("identity not allowed".into()))
 }
 
-pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
-    let team = var(env, "ACCESS_TEAM_DOMAIN");
-    let aud = var(env, "ACCESS_AUD");
-
-    // Local development only (`.dev.vars`). Ignored as soon as Access is configured,
-    // so it can never open a deployed Worker.
-    let dev = var(env, "DEV_AUTH_EMAIL");
-    if !dev.is_empty() && aud.is_empty() && team.is_empty() {
-        return Ok(Identity { email: dev });
-    }
-
+/// Cloudflare Access: admins and service tokens only.
+async fn verify_access(token: &str, env: &Env) -> Result<String, AuthError> {
     let emails = list(&var(env, "ADMIN_EMAILS"));
     let service_tokens = list(&var(env, "ADMIN_SERVICE_TOKENS"));
-    if team.is_empty() || aud.is_empty() {
-        return Err(AuthError::NotConfigured(
-            "ACCESS_TEAM_DOMAIN and ACCESS_AUD must be set",
-        ));
-    }
     if emails.is_empty() && service_tokens.is_empty() {
         return Err(AuthError::NotConfigured("ADMIN_EMAILS must be set"));
     }
-    let team = team
+    let aud = var(env, "ACCESS_AUD");
+    let team = var(env, "ACCESS_TEAM_DOMAIN")
         .trim_start_matches("https://")
         .trim_end_matches('/')
         .to_string();
-
-    let token = token_from(req)
-        .ok_or_else(|| AuthError::Denied("missing Cloudflare Access token".into()))?;
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(AuthError::Denied("malformed token".into()));
-    }
-    let header: Header = b64url_decode(parts[0])
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| AuthError::Denied("bad token header".into()))?;
-    if header.alg != "RS256" {
-        return Err(AuthError::Denied("unexpected token algorithm".into()));
-    }
-    let claims: Claims = b64url_decode(parts[1])
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| AuthError::Denied("bad token payload".into()))?;
-    let sig =
-        b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
-
-    let keys = jwks(&team)
-        .await
-        .map_err(|e| AuthError::Denied(format!("could not fetch Access certs: {e}")))?;
-    let candidates: Vec<&serde_json::Value> = keys
-        .iter()
-        .filter(|k| match &header.kid {
-            Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid.as_str()),
-            None => true,
-        })
-        .collect();
-    let signed = format!("{}.{}", parts[0], parts[1]);
-    let mut valid = false;
-    for k in candidates {
-        if verify_rs256(k, signed.as_bytes(), &sig)
-            .await
-            .unwrap_or(false)
-        {
-            valid = true;
-            break;
-        }
-    }
-    if !valid {
-        // Keys may have rotated: drop the cache so the next request refetches.
-        JWKS.with(|c| *c.borrow_mut() = None);
-        return Err(AuthError::Denied("invalid token signature".into()));
-    }
+    let claims: Claims = verify_jwt(token, &format!("https://{team}/cdn-cgi/access/certs")).await?;
     check_claims(
         &claims,
         &aud,
@@ -226,6 +240,55 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
         &emails,
         &service_tokens,
     )
+}
+
+fn internal(e: worker::Error) -> AuthError {
+    worker::console_error!("auth: {e}");
+    AuthError::Denied("could not check your session, try again".into())
+}
+
+async fn identity_for_email(env: &Env, email: String, admin: bool) -> Result<Identity, AuthError> {
+    let user_id = account::user_id_for_email(env, &email)
+        .await
+        .map_err(internal)?;
+    Ok(Identity {
+        user_id,
+        email,
+        name: None,
+        admin,
+    })
+}
+
+/// The caller's identity, `Ok(None)` when not signed in.
+pub async fn identify(req: &Request, env: &Env) -> Result<Option<Identity>, AuthError> {
+    if let Some(token) = account::cookie(req, account::SESSION_COOKIE) {
+        if let Some(u) = account::session_user(env, &token).await.map_err(internal)? {
+            if u.banned != 0 {
+                return Err(AuthError::Denied("This account is suspended.".into()));
+            }
+            return Ok(Some(Identity {
+                user_id: u.id,
+                admin: is_admin(env, &u.email),
+                email: u.email,
+                name: u.name,
+            }));
+        }
+    }
+    if let Some(dev) = dev_email(env) {
+        return identity_for_email(env, dev, true).await.map(Some);
+    }
+    if access_configured(env) {
+        if let Some(token) = access_token(req) {
+            let email = verify_access(&token, env).await?;
+            return identity_for_email(env, email, true).await.map(Some);
+        }
+    }
+    if !google_configured(env) && !access_configured(env) {
+        return Err(AuthError::NotConfigured(
+            "Sign-in is not configured: set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (or Cloudflare Access).",
+        ));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -243,9 +306,7 @@ mod tests {
             r#"{"aud":["AUD"],"iss":"https://t.cloudflareaccess.com","exp":2000,"email":"Radu@example.com"}"#,
         );
         assert_eq!(
-            check_claims(&ok, "AUD", "t.cloudflareaccess.com", 1000, &emails, &[])
-                .unwrap()
-                .email,
+            check_claims(&ok, "AUD", "t.cloudflareaccess.com", 1000, &emails, &[]).unwrap(),
             "radu@example.com"
         );
 

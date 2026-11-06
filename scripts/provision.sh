@@ -5,7 +5,9 @@
 #   - Workers KV namespace  xorio-301-links
 #   - D1 database           xorio-301
 #   - Access application    "301 admin" on $DOMAIN/_ and $DOMAIN/api,
-#                           allowing only ADMIN_EMAILS
+#                           allowing only ADMIN_EMAILS. Skipped (and an existing one
+#                           deleted) when GOOGLE_CLIENT_ID is set: the app then has to be
+#                           public so anyone can shorten links and sign in with Google.
 #
 # Needs: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID. Optional: ADMIN_EMAILS (defaults
 # to the token owner's email), ACCESS_TEAM_DOMAIN (looked up when the token can read it),
@@ -60,6 +62,21 @@ if [[ -z "${ADMIN_EMAILS:-}" ]]; then
 fi
 echo "   $ADMIN_EMAILS"
 
+if [[ -n "${GOOGLE_CLIENT_ID:-}" ]]; then
+  echo "== Google sign-in configured: Cloudflare Access is not used"
+  APP_ID=$(cf GET "$ACC/access/apps?per_page=100" | jq -r --arg n "$APP_NAME" '[.result[] | select(.name==$n)][0].id // empty') || APP_ID=""
+  if [[ -n "$APP_ID" ]]; then
+    cf DELETE "$ACC/access/apps/$APP_ID" >/dev/null && echo "   deleted Access application '$APP_NAME' ($APP_ID)"
+  fi
+  ACCESS_TEAM_DOMAIN=""
+  ACCESS_AUD=""
+  SKIP_ACCESS=1
+  if [[ -n "${ADMIN_SERVICE_TOKENS:-}" ]]; then
+    echo "   warning: ADMIN_SERVICE_TOKENS no longer work without Cloudflare Access" >&2
+  fi
+fi
+
+if [[ -z "${SKIP_ACCESS:-}" ]]; then
 echo "== Access team domain"
 if [[ -z "${ACCESS_TEAM_DOMAIN:-}" ]]; then
   ACCESS_TEAM_DOMAIN=$(cf GET "$ACC/access/organizations" | jq -r '.result.auth_domain // empty') || true
@@ -70,6 +87,8 @@ if [[ -z "${ACCESS_TEAM_DOMAIN:-}" ]]; then
   exit 1
 fi
 echo "   $ACCESS_TEAM_DOMAIN"
+
+fi # SKIP_ACCESS (team domain)
 
 if [[ -z "${DOMAIN:-}" ]]; then
   SUB=$(cf GET "$ACC/workers/subdomain" | jq -r '.result.subdomain // empty') || true
@@ -82,6 +101,7 @@ fi
 echo "== Host: $DOMAIN"
 [[ -n "${GITHUB_ENV:-}" ]] && echo "DOMAIN=$DOMAIN" >> "$GITHUB_ENV"
 
+if [[ -z "${SKIP_ACCESS:-}" ]]; then
 echo "== Access application '$APP_NAME'"
 include=$(jq -nc --arg e "$ADMIN_EMAILS" '[$e | split(",")[] | gsub("^\\s+|\\s+$";"") | select(length>0) | {email:{email:.}}]')
 APP=$(cf GET "$ACC/access/apps?per_page=100" | jq -c --arg n "$APP_NAME" '[.result[] | select(.name==$n)][0] // empty')
@@ -110,6 +130,8 @@ else
   cf PUT "$ACC/access/apps/$APP_ID/policies/$POL_ID" "$pol_body" >/dev/null && echo "   updated"
 fi
 
+fi # SKIP_ACCESS
+
 echo "== Writing $TOML"
 sed -i.bak \
   -e "s|^id = \"REPLACE_KV_ID\"|id = \"$KV_ID\"|" \
@@ -118,7 +140,9 @@ sed -i.bak \
   -e "s|^ACCESS_AUD = \".*\"|ACCESS_AUD = \"$ACCESS_AUD\"|" \
   -e "s|^ADMIN_EMAILS = \".*\"|ADMIN_EMAILS = \"$ADMIN_EMAILS\"|" \
   -e "s|^ADMIN_SERVICE_TOKENS = \".*\"|ADMIN_SERVICE_TOKENS = \"${ADMIN_SERVICE_TOKENS:-}\"|" \
+  -e "s|^GOOGLE_CLIENT_ID = \".*\"|GOOGLE_CLIENT_ID = \"${GOOGLE_CLIENT_ID:-}\"|" \
+  -e "s|^TURNSTILE_SITE_KEY = \".*\"|TURNSTILE_SITE_KEY = \"${TURNSTILE_SITE_KEY:-}\"|" \
   "$TOML"
 rm -f "$TOML.bak"
-grep -nE '^(id|database_id|ACCESS_TEAM_DOMAIN|ACCESS_AUD|ADMIN_EMAILS) =' "$TOML"
+grep -nE '^(id|database_id|ACCESS_TEAM_DOMAIN|ACCESS_AUD|ADMIN_EMAILS|GOOGLE_CLIENT_ID|TURNSTILE_SITE_KEY) =' "$TOML"
 echo "Provisioned."

@@ -69,7 +69,9 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
             };
         }
         "robots.txt" => {
-            return Response::ok("User-agent: *\nDisallow: /_/\nDisallow: /api/\n");
+            return Response::ok(
+                "User-agent: *\nDisallow: /_/\nDisallow: /api/\nDisallow: /auth/\n",
+            );
         }
         "favicon.ico" | "favicon.svg" => {
             let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#1d5fa8"/><text x="32" y="42" font-family="monospace" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">301</text></svg>"##;
@@ -95,6 +97,9 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         };
     };
 
+    if rec.blocked {
+        return pages::gone("It was removed for breaking the rules of this service.");
+    }
     if rec.disabled {
         return pages::gone("It was disabled by its owner.");
     }

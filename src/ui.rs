@@ -1,4 +1,4 @@
-//! The admin single-page app, compiled into the Worker.
+//! The single-page app (anonymous shortener, user and admin views), compiled into the Worker.
 
 use worker::{Response, Result};
 
@@ -22,7 +22,8 @@ pub fn serve(path: &str) -> Result<Response> {
     h.set("Referrer-Policy", "same-origin")?;
     h.set(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
+        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; \
+         script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self'; frame-ancestors 'none'",
     )?;
     Ok(res)
 }

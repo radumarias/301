@@ -89,3 +89,14 @@ tr.link-row { cursor: pointer; } tr.link-row:hover td { background: var(--soft);
 .kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--line); background: var(--soft); border-radius: 4px; padding: 0 4px; }
 code { font: 500 .85em var(--mono); background: var(--soft); padding: .06em .32em; border-radius: 4px; }
 .slug-row input { flex: 1 1 140px; width: auto; min-width: 0; }
+.badge.anon { background: var(--soft); color: var(--fg); } .badge.blocked { background: var(--bad-soft); color: var(--bad); }
+[hidden] { display: none !important; }
+.top-right { margin-left: auto; }
+.hero { max-width: 720px; margin: 24px auto 0; }
+.hero h1 { font-size: 34px; }
+.shorten { display: flex; gap: 8px; flex-wrap: wrap; }
+.shorten input[type=url] { flex: 1 1 280px; width: auto; }
+.shorten select { width: auto; }
+.result { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 16px; }
+.ts { min-height: 0; margin-top: 10px; }
+.notice { background: var(--warn-soft); color: var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 14px; }

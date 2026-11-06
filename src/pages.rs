@@ -88,7 +88,8 @@ pub fn preview(slug: &str, dest: &str) -> Result<Response> {
         200,
         "Link preview",
         &format!(
-            "<h1>/{s} goes to</h1><p>{d}</p><a class=btn href=\"{d}\" rel=\"noopener noreferrer\">Continue</a>",
+            "<h1>/{s} goes to</h1><p>{d}</p><a class=btn href=\"{d}\" rel=\"noopener noreferrer\">Continue</a>\
+             <p style=\"margin:18px 0 0\"><small><a href=\"/_/#/report/{s}\">Report this link</a></small></p>",
             s = esc(slug),
             d = esc(dest)
         ),
@@ -99,27 +100,17 @@ pub fn landing() -> Result<Response> {
     page(
         200,
         "301.xorio.rs",
-        "<div class=code>301</div><h1>301.xorio.rs</h1><p>A personal link shortener.</p>",
+        "<div class=code>301</div><h1>301.xorio.rs</h1><p>A small, fast link shortener. Shorten a link without an account, or sign in with Google to manage yours.</p>\
+         <a class=btn href=\"/_/\">Shorten a link</a>",
     )
 }
 
-pub fn forbidden(msg: &str) -> Result<Response> {
+pub fn auth_failed(msg: &str) -> Result<Response> {
     page(
         403,
-        "Forbidden",
+        "Sign-in failed",
         &format!(
-            "<div class=code>403</div><h1>Admin access only</h1><p>{}</p>",
-            esc(msg)
-        ),
-    )
-}
-
-pub fn unconfigured(msg: &str) -> Result<Response> {
-    page(
-        503,
-        "Not configured",
-        &format!(
-            "<div class=code>503</div><h1>Admin is not configured</h1><p>{}</p>",
+            "<h1>Sign-in failed</h1><p>{}</p><a class=btn href=\"/_/\">Back</a>",
             esc(msg)
         ),
     )
