@@ -95,6 +95,82 @@ pub fn preview(slug: &str, dest: &str) -> Result<Response> {
     )
 }
 
+/// The card a link-preview crawler sees: Open Graph and Twitter tags, plus a refresh to
+/// the destination for anything that renders it. Password-protected links get no
+/// refresh, so the destination never leaks.
+pub fn social_card(og: &crate::model::Og, dest: Option<&str>) -> Result<Response> {
+    let title = og.title.as_deref().unwrap_or("");
+    let mut meta = String::new();
+    let mut tag = |prop: &str, v: &str, name: bool| {
+        let attr = if name { "name" } else { "property" };
+        meta.push_str(&format!("<meta {attr}=\"{prop}\" content=\"{}\">", esc(v)));
+    };
+    if let Some(t) = &og.title {
+        tag("og:title", t, false);
+        tag("twitter:title", t, true);
+    }
+    if let Some(d) = &og.description {
+        tag("og:description", d, false);
+        tag("description", d, true);
+        tag("twitter:description", d, true);
+    }
+    if let Some(i) = &og.image {
+        tag("og:image", i, false);
+        tag("twitter:image", i, true);
+        tag("twitter:card", "summary_large_image", true);
+    } else {
+        tag("twitter:card", "summary", true);
+    }
+    tag("og:type", "website", false);
+    if let Some(d) = dest {
+        tag("og:url", d, false);
+        meta.push_str(&format!(
+            "<meta http-equiv=\"refresh\" content=\"0;url={}\">",
+            esc(d)
+        ));
+    }
+    let html = format!(
+        "<!doctype html><html lang=en><head><meta charset=utf-8><title>{t}</title>{meta}</head><body><h1>{t}</h1></body></html>",
+        t = esc(title)
+    );
+    let mut res = Response::from_html(html)?;
+    let h = res.headers_mut();
+    h.set("Cache-Control", "public, max-age=300")?;
+    // Same URL as the redirect: shared caches must not hand the card to people.
+    h.set("Vary", "User-Agent")?;
+    h.set("X-Robots-Tag", "noindex")?;
+    h.set("Content-Security-Policy", "default-src 'none'; img-src *")?;
+    Ok(res)
+}
+
+/// Tries to open the native app and falls back to the web destination when the app is
+/// not installed (the page stays visible, so the timer fires).
+pub fn open_app(app_uri: &str, web: &str) -> Result<Response> {
+    let nonce = crate::util::hex(&crate::crypto::random_bytes(16));
+    // JSON-encode for the script, then escape `<` so `</script>` cannot appear.
+    let js = |v: &str| {
+        serde_json::to_string(v)
+            .unwrap_or_default()
+            .replace('<', "\\u003c")
+    };
+    let body = format!(
+        "<h1>Opening the app…</h1><p>If nothing happens, continue in the browser.</p>\
+         <a class=btn href=\"{a}\">Open app</a> <a class=btn href=\"{w}\" rel=\"noopener noreferrer\">Continue in browser</a>\
+         <script nonce=\"{nonce}\">(function(){{var app={ja},web={jw},t=setTimeout(function(){{location.replace(web)}},1500);\
+         document.addEventListener('visibilitychange',function(){{if(document.hidden)clearTimeout(t)}});location.href=app}})();</script>",
+        a = esc(app_uri),
+        w = esc(web),
+        ja = js(app_uri),
+        jw = js(web),
+    );
+    let mut res = page(200, "Opening…", &body)?;
+    res.headers_mut().set(
+        "Content-Security-Policy",
+        &format!("default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; frame-ancestors 'none'"),
+    )?;
+    Ok(res)
+}
+
 pub fn landing() -> Result<Response> {
     page(
         200,

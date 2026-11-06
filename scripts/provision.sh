@@ -4,12 +4,17 @@
 #
 #   - Workers KV namespace  xorio-301-links
 #   - D1 database           xorio-301
+#   - R2 bucket             xorio-301-backups (nightly backups; skipped, and its
+#                           binding removed, when R2 is not enabled on the account)
 #   - Access application    "301 admin" on $DOMAIN/_ and $DOMAIN/api,
 #                           allowing only ADMIN_EMAILS
+#   - Custom domain route   when DOMAIN is set to something other than *.workers.dev
 #
 # Needs: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID. Optional: ADMIN_EMAILS (defaults
 # to the token owner's email), ACCESS_TEAM_DOMAIN (looked up when the token can read it),
-# DOMAIN (default: the Worker's workers.dev host, xorio-301.<account subdomain>.workers.dev).
+# DOMAIN (default: the Worker's workers.dev host, xorio-301.<account subdomain>.workers.dev),
+# ANALYTICS_API_TOKEN (keeps the Analytics Engine binding), and WORKER_NAME / KV_TITLE /
+# D1_NAME / R2_BUCKET / AE_DATASET / APP_NAME / TOML to provision a second copy (staging).
 set -euo pipefail
 
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
@@ -17,6 +22,8 @@ set -euo pipefail
 WORKER_NAME="${WORKER_NAME:-xorio-301}"
 KV_TITLE="${KV_TITLE:-xorio-301-links}"
 D1_NAME="${D1_NAME:-xorio-301}"
+R2_BUCKET="${R2_BUCKET:-xorio-301-backups}"
+AE_DATASET="${AE_DATASET:-xorio_301_clicks}"
 APP_NAME="${APP_NAME:-301 admin}"
 API="https://api.cloudflare.com/client/v4"
 ACC="$API/accounts/$CLOUDFLARE_ACCOUNT_ID"
@@ -52,6 +59,17 @@ if [[ -z "$D1_ID" ]]; then
   echo "   created $D1_ID"
 else
   echo "   exists  $D1_ID"
+fi
+
+echo "== R2 bucket $R2_BUCKET"
+R2_OK=1
+if curl -sS "$ACC/r2/buckets/$R2_BUCKET" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -e '.success' >/dev/null; then
+  echo "   exists"
+elif cf POST "$ACC/r2/buckets" "$(jq -nc --arg n "$R2_BUCKET" '{name:$n}')" >/dev/null; then
+  echo "   created"
+else
+  R2_OK=0
+  echo "   R2 is not available (enable it in the dashboard and give the token R2 Edit); backups stay off" >&2
 fi
 
 echo "== Admin emails"
@@ -111,6 +129,18 @@ else
 fi
 
 echo "== Writing $TOML"
+if [[ -z "${ANALYTICS_API_TOKEN:-}" ]]; then
+  echo "   no ANALYTICS_API_TOKEN: clicks are logged to D1 (Analytics Engine binding removed)"
+  sed -i.bak '/^# >>> ae/,/^# <<< ae/d' "$TOML"
+fi
+if [[ "$R2_OK" != 1 ]]; then
+  sed -i.bak '/^# >>> r2/,/^# <<< r2/d' "$TOML"
+fi
+if [[ "$DOMAIN" != *.workers.dev ]]; then
+  # Serve on the custom domain instead of workers.dev (DNS record and cert are automatic
+  # when the zone is on this account).
+  sed -i.bak "s|^workers_dev = true|workers_dev = false\nroutes = [{ pattern = \"$DOMAIN\", custom_domain = true }]|" "$TOML"
+fi
 sed -i.bak \
   -e "s|^id = \"REPLACE_KV_ID\"|id = \"$KV_ID\"|" \
   -e "s|^database_id = \"REPLACE_D1_ID\"|database_id = \"$D1_ID\"|" \
@@ -118,7 +148,12 @@ sed -i.bak \
   -e "s|^ACCESS_AUD = \".*\"|ACCESS_AUD = \"$ACCESS_AUD\"|" \
   -e "s|^ADMIN_EMAILS = \".*\"|ADMIN_EMAILS = \"$ADMIN_EMAILS\"|" \
   -e "s|^ADMIN_SERVICE_TOKENS = \".*\"|ADMIN_SERVICE_TOKENS = \"${ADMIN_SERVICE_TOKENS:-}\"|" \
+  -e "s|^CLOUDFLARE_ACCOUNT_ID = \".*\"|CLOUDFLARE_ACCOUNT_ID = \"$CLOUDFLARE_ACCOUNT_ID\"|" \
+  -e "s|^AE_DATASET = \".*\"|AE_DATASET = \"$AE_DATASET\"|" \
+  -e "s|^dataset = \"xorio_301_clicks\"|dataset = \"$AE_DATASET\"|" \
+  -e "s|^bucket_name = \"xorio-301-backups\"|bucket_name = \"$R2_BUCKET\"|" \
+  -e "s|^name = \"xorio-301\"|name = \"$WORKER_NAME\"|" \
   "$TOML"
 rm -f "$TOML.bak"
-grep -nE '^(id|database_id|ACCESS_TEAM_DOMAIN|ACCESS_AUD|ADMIN_EMAILS) =' "$TOML"
+grep -nE '^(name|id|database_id|bucket_name|dataset|routes|workers_dev|ACCESS_TEAM_DOMAIN|ACCESS_AUD|ADMIN_EMAILS) =' "$TOML"
 echo "Provisioned."

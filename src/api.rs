@@ -5,12 +5,36 @@ use crate::model::{Link, LinkInput};
 use crate::slug::Style;
 use crate::store::{self, n, s, CountRow, SResult, StoreError};
 use crate::util::{self, csv_field, iso, json, json_error, now_ms};
-use crate::{import, qr};
+use crate::{analytics, backup, health, import, qr, webhooks};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use wasm_bindgen::JsValue;
-use worker::{Env, Method, Request, Response, Result};
+use worker::{Context, Env, Method, Request, Response, Result};
+
+/// Sends a link event for some links to webhooks after the response.
+fn fire_links(env: &Env, ctx: &Context, event: &'static str, links: &[Link]) {
+    let env = env.clone();
+    let data = links
+        .iter()
+        .map(|l| serde_json::to_value(l).unwrap_or_default())
+        .collect();
+    ctx.wait_until(async move { webhooks::fire_links(&env, event, data).await });
+}
+
+/// Responds with a stored link and, on success, fires the matching webhook event.
+fn fired(
+    env: &Env,
+    ctx: &Context,
+    event: &'static str,
+    r: SResult<Link>,
+    status: u16,
+) -> Result<Response> {
+    if let Ok(l) = &r {
+        fire_links(env, ctx, event, std::slice::from_ref(l));
+    }
+    respond(r, status)
+}
 
 fn store_err(e: StoreError) -> Result<Response> {
     let status = match e {
@@ -61,7 +85,7 @@ fn same_origin(req: &Request) -> bool {
     }
 }
 
-pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
+pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     let who = match auth::verify(&req, &env).await {
         Ok(w) => w,
         Err(AuthError::NotConfigured(m)) => return json_error(m, 503),
@@ -87,6 +111,10 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         },
         _ => None,
     };
+    let hook_id = match segs.as_slice() {
+        ["webhooks", id, ..] => id.parse::<i64>().ok(),
+        _ => None,
+    };
 
     match (req.method(), segs.as_slice(), link_id) {
         (Method::Get, ["me"], _) => json(&serde_json::json!({ "email": who.email }), 200),
@@ -94,11 +122,17 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["links"], _) => list_links(&env, &query).await,
         (Method::Post, ["links"], _) => {
             let input: LinkInput = body!(req);
-            respond(store::create_link(&env, &input).await, 201)
+            fired(
+                &env,
+                &ctx,
+                "link.created",
+                store::create_link(&env, &input).await,
+                201,
+            )
         }
         (Method::Post, ["links", "bulk"], _) => {
             let b: Bulk = body!(req);
-            bulk(&env, b).await
+            bulk(&env, &ctx, b).await
         }
         (Method::Get, ["links", _], Some(id)) => match store::get_link(&env, id).await? {
             Some(l) => json(&l, 200),
@@ -106,10 +140,26 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         },
         (Method::Patch | Method::Put, ["links", _], Some(id)) => {
             let input: LinkInput = body!(req);
-            respond(store::update_link(&env, id, &input).await, 200)
+            fired(
+                &env,
+                &ctx,
+                "link.updated",
+                store::update_link(&env, id, &input).await,
+                200,
+            )
         }
-        (Method::Delete, ["links", _], Some(id)) => {
-            respond(store::delete_link(&env, id).await.map(|_| ok_json()), 200)
+        (Method::Delete, ["links", _], Some(id)) => match store::delete_link(&env, id).await {
+            Ok(link) => {
+                fire_links(&env, &ctx, "link.deleted", &[link]);
+                json(&ok_json(), 200)
+            }
+            Err(e) => store_err(e),
+        },
+        (Method::Post, ["links", _, "check"], Some(id)) => {
+            let Some(link) = store::get_link(&env, id).await? else {
+                return json_error("not found", 404);
+            };
+            json(&health::check_link(&env, id, &link.url).await?, 200)
         }
         (Method::Delete, ["links", _, "aliases", alias @ ..], Some(id)) => respond(
             store::delete_alias(&env, id, &alias.join("/"))
@@ -177,6 +227,57 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             let b: import::CommitRequest = body!(req);
             respond(import::commit(&env, b).await, 200)
         }
+        (Method::Get, ["status"], _) => status(&env).await,
+
+        (Method::Get, ["webhooks"], _) => json(&webhooks::list(&env).await?, 200),
+        (Method::Post, ["webhooks"], _) => {
+            let input: webhooks::HookInput = body!(req);
+            respond(webhooks::create(&env, &input).await, 201)
+        }
+        (Method::Delete, ["webhooks", _], _) => match hook_id {
+            Some(id) => respond(webhooks::delete(&env, id).await.map(|_| ok_json()), 200),
+            None => json_error("bad id", 400),
+        },
+        (Method::Post, ["webhooks", _, "test"], _) => {
+            let hooks = webhooks::list(&env).await?;
+            let Some(hook) = hooks.iter().find(|h| Some(h.id) == hook_id) else {
+                return json_error("not found", 404);
+            };
+            let (status, error) =
+                webhooks::deliver(hook, "test", &serde_json::json!({ "hello": "from 301" })).await;
+            json(
+                &serde_json::json!({ "status": status, "error": error }),
+                200,
+            )
+        }
+
+        (_, ["backups", ..], _) if !backup::enabled(&env) => {
+            json_error("backups need an R2 bucket bound as BACKUPS", 503)
+        }
+        (Method::Get, ["backups"], _) => json(&backup::list(&env).await?, 200),
+        (Method::Post, ["backups"], _) => {
+            json(&serde_json::json!({ "key": backup::run(&env).await? }), 201)
+        }
+        (Method::Get, ["backups", "download"], _) => {
+            let key = q("key").unwrap_or_default();
+            if !backup::valid_key(key) {
+                return json_error("not found", 404);
+            }
+            let Some(obj) = env.bucket(backup::BINDING)?.get(key).execute().await? else {
+                return json_error("not found", 404);
+            };
+            let Some(b) = obj.body() else {
+                return json_error("empty backup", 500);
+            };
+            let mut res = util::body(b.text().await?, "application/json")?;
+            let name = key.trim_start_matches("daily/");
+            res.headers_mut().set(
+                "Content-Disposition",
+                &format!("attachment; filename=\"301-backup-{name}\""),
+            )?;
+            Ok(res)
+        }
+
         (Method::Get, ["export"], _) => export(&env, q("format").unwrap_or("csv")).await,
         (Method::Post, ["maintenance", "rebuild-kv"], _) => {
             rebuild_kv(&env, q("after").and_then(|v| v.parse().ok()).unwrap_or(0)).await
@@ -216,6 +317,7 @@ async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> 
         Some("expired") => wheres.push(format!("disabled = 0 AND {expired}")),
         Some("active") => wheres.push(format!("disabled = 0 AND NOT {expired}")),
         Some("protected") => wheres.push("password_hash IS NOT NULL".into()),
+        Some("broken") => wheres.push(crate::model::BROKEN_SQL.into()),
         _ => {}
     }
     if wheres.iter().any(|w| w.contains(&now_bind)) {
@@ -297,7 +399,7 @@ struct Bulk {
     tags: Vec<String>,
 }
 
-async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
+async fn bulk(env: &Env, ctx: &Context, body: Bulk) -> Result<Response> {
     if body.ids.len() > 200 {
         return json_error("at most 200 links per bulk action", 400);
     }
@@ -330,10 +432,12 @@ async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
     let links = store::with_aliases(env, links).await?;
 
     let Some(input) = input else {
-        return respond(
-            store::delete_links(env, &links)
-                .await
-                .map(|_| serde_json::json!({ "done": links.len(), "errors": [] })),
+        if let Err(e) = store::delete_links(env, &links).await {
+            return store_err(e);
+        }
+        fire_links(env, ctx, "link.deleted", &links);
+        return json(
+            &serde_json::json!({ "done": links.len(), "errors": [] }),
             200,
         );
     };
@@ -358,6 +462,7 @@ async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
             return store_err(e);
         }
     }
+    fire_links(env, ctx, "link.updated", &updated);
     json(
         &serde_json::json!({ "done": updated.len(), "errors": errors }),
         200,
@@ -393,14 +498,59 @@ struct Bucket {
 
 const DIMENSIONS: [&str; 6] = ["country", "referrer", "device", "os", "browser", "city"];
 
-async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
-    let (since, bucket) = range(r);
+/// Click aggregates from one source (D1 rows or Analytics Engine), merged before output.
+#[derive(Default)]
+struct Agg {
+    humans: i64,
+    bots: i64,
+    qr: i64,
+    series: BTreeMap<i64, i64>,
+    dims: HashMap<String, HashMap<Option<String>, i64>>,
+    top_links: HashMap<i64, i64>,
+}
+
+impl Agg {
+    fn merge(&mut self, o: Agg) {
+        self.humans += o.humans;
+        self.bots += o.bots;
+        self.qr += o.qr;
+        for (t, n) in o.series {
+            *self.series.entry(t).or_default() += n;
+        }
+        for (d, m) in o.dims {
+            let e = self.dims.entry(d).or_default();
+            for (k, n) in m {
+                *e.entry(k).or_default() += n;
+            }
+        }
+        for (id, n) in o.top_links {
+            *self.top_links.entry(id).or_default() += n;
+        }
+    }
+}
+
+fn top_n<K: Clone + Ord>(m: &HashMap<K, i64>, n: usize) -> Vec<(K, i64)> {
+    let mut v: Vec<(K, i64)> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(n);
+    v
+}
+
+fn dims_for(link: Option<i64>) -> Vec<&'static str> {
+    let mut d = DIMENSIONS.to_vec();
+    if link.is_some() {
+        d.push("variant");
+    }
+    d
+}
+
+async fn d1_stats(env: &Env, link: Option<i64>, since: i64, bucket: i64) -> Result<Agg> {
     let d = store::db(env)?;
     let (filter, binds): (&str, Vec<JsValue>) = match link {
         Some(id) => ("link_id = ?1 AND ts >= ?2", vec![n(id), n(since)]),
         None => ("ts >= ?1", vec![n(since)]),
     };
-
+    let dims = dims_for(link);
     // Everything in one D1 round trip.
     let mut stmts = vec![
         d.prepare(format!(
@@ -413,10 +563,15 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
         ))
         .bind(&binds)?,
     ];
-    for col in DIMENSIONS {
+    for col in &dims {
+        let (expr, extra) = if *col == "variant" {
+            ("variant", " AND variant IS NOT NULL")
+        } else {
+            (*col, "")
+        };
         stmts.push(
             d.prepare(format!(
-                "SELECT {col} AS k, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0 GROUP BY {col} ORDER BY n DESC LIMIT 10"
+                "SELECT {expr} AS k, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0{extra} GROUP BY k ORDER BY n DESC LIMIT 10"
             ))
             .bind(&binds)?,
         );
@@ -424,12 +579,10 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
     if link.is_none() {
         stmts.push(
             d.prepare(
-                "SELECT l.id, l.slug, l.url, l.title, COUNT(*) AS n FROM clicks c JOIN links l ON l.id = c.link_id \
-                 WHERE c.ts >= ?1 AND c.bot = 0 GROUP BY l.id ORDER BY n DESC LIMIT 10",
+                "SELECT CAST(link_id AS TEXT) AS k, COUNT(*) AS n FROM clicks WHERE ts >= ?1 AND bot = 0 GROUP BY link_id ORDER BY n DESC LIMIT 10",
             )
             .bind(&binds)?,
         );
-        stmts.push(d.prepare("SELECT COUNT(*) AS n FROM links"));
     }
     let res = d.batch(stmts).await?;
 
@@ -440,33 +593,204 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
         qr: Option<i64>,
     }
     let totals = res[0].results::<Totals>()?.into_iter().next();
-    let mut dims = serde_json::Map::new();
-    for (i, col) in DIMENSIONS.iter().enumerate() {
-        dims.insert(
+    let mut agg = Agg {
+        humans: totals.as_ref().and_then(|t| t.humans).unwrap_or(0),
+        bots: totals.as_ref().and_then(|t| t.bots).unwrap_or(0),
+        qr: totals.as_ref().and_then(|t| t.qr).unwrap_or(0),
+        series: res[1]
+            .results::<Bucket>()?
+            .into_iter()
+            .map(|b| (b.t, b.n))
+            .collect(),
+        ..Default::default()
+    };
+    for (i, col) in dims.iter().enumerate() {
+        agg.dims.insert(
             col.to_string(),
-            serde_json::to_value(res[2 + i].results::<KV>()?).unwrap_or_default(),
+            res[2 + i]
+                .results::<KV>()?
+                .into_iter()
+                .map(|r| (r.k, r.n))
+                .collect(),
         );
     }
+    if link.is_none() {
+        agg.top_links = res[2 + dims.len()]
+            .results::<KV>()?
+            .into_iter()
+            .filter_map(|r| r.k.and_then(|k| k.parse().ok()).map(|id| (id, r.n)))
+            .collect();
+    }
+    Ok(agg)
+}
+
+async fn ae_stats(
+    cfg: &analytics::Config,
+    link: Option<i64>,
+    since: i64,
+    bucket: i64,
+) -> Result<Agg> {
+    let dims = dims_for(link);
+    let sql = analytics::stats_sql(&cfg.dataset, since, bucket, link, &dims);
+    let rows = futures_util::future::join_all(sql.iter().map(|q| analytics::query(cfg, q)))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let first = rows[0].first();
+    let mut agg = Agg {
+        humans: analytics::num(first.and_then(|r| r.get("humans"))),
+        bots: analytics::num(first.and_then(|r| r.get("bots"))),
+        qr: analytics::num(first.and_then(|r| r.get("qr"))),
+        // Seconds in Analytics Engine, milliseconds in the API.
+        series: rows[1]
+            .iter()
+            .map(|r| {
+                (
+                    analytics::num(r.get("t")) * 1000,
+                    analytics::num(r.get("n")),
+                )
+            })
+            .collect(),
+        ..Default::default()
+    };
+    for (i, col) in dims.iter().enumerate() {
+        agg.dims.insert(
+            col.to_string(),
+            rows[2 + i]
+                .iter()
+                .map(|r| (analytics::text(r.get("k")), analytics::num(r.get("n"))))
+                .collect(),
+        );
+    }
+    if link.is_none() {
+        agg.top_links = rows[2 + dims.len()]
+            .iter()
+            .filter_map(|r| {
+                analytics::text(r.get("k"))
+                    .and_then(|k| k.parse().ok())
+                    .map(|id| (id, analytics::num(r.get("n"))))
+            })
+            .collect();
+    }
+    Ok(agg)
+}
+
+async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
+    let (since, bucket) = range(r);
+    // D1 holds clicks from before Analytics Engine was switched on (and all clicks when it
+    // is off); both are added up.
+    let cfg = analytics::config(env);
+    let ae = async {
+        match &cfg {
+            Some(c) => Some(ae_stats(c, link, since, bucket).await),
+            None => None,
+        }
+    };
+    let (d1, ae) = futures_util::future::join(d1_stats(env, link, since, bucket), ae).await;
+    let mut agg = d1?;
+    let mut analytics_error = None;
+    match ae {
+        Some(Ok(a)) => agg.merge(a),
+        Some(Err(e)) => {
+            worker::console_error!("analytics engine stats failed: {e}");
+            analytics_error = Some(
+                "Analytics Engine could not be queried; showing database clicks only".to_string(),
+            );
+        }
+        None => {}
+    }
+
+    let mut dims = serde_json::Map::new();
+    for (col, m) in &agg.dims {
+        let rows: Vec<KV> = top_n(m, 10).into_iter().map(|(k, n)| KV { k, n }).collect();
+        dims.insert(col.clone(), serde_json::to_value(rows).unwrap_or_default());
+    }
+    let series: Vec<Bucket> = agg
+        .series
+        .iter()
+        .map(|(t, n)| Bucket { t: *t, n: *n })
+        .collect();
     let mut out = serde_json::json!({
         "range": r,
         "bucket_ms": bucket,
         "since": since,
-        "clicks": totals.as_ref().and_then(|t| t.humans).unwrap_or(0),
-        "bots": totals.as_ref().and_then(|t| t.bots).unwrap_or(0),
-        "qr": totals.as_ref().and_then(|t| t.qr).unwrap_or(0),
-        "series": res[1].results::<Bucket>()?,
+        "clicks": agg.humans,
+        "bots": agg.bots,
+        "qr": agg.qr,
+        "series": series,
         "top": dims,
+        "analytics_engine": cfg.is_some(),
+        "analytics_error": analytics_error,
     });
     if link.is_none() {
-        out["top_links"] = serde_json::Value::Array(res[8].results::<serde_json::Value>()?);
-        out["links"] = res[9]
-            .results::<CountRow>()?
-            .first()
-            .map(|c| c.n)
-            .unwrap_or(0)
+        // Extra candidates: deleted links (still in Analytics Engine) are skipped below.
+        let top = top_n(&agg.top_links, 20);
+        let mut info: HashMap<i64, serde_json::Value> = HashMap::new();
+        if !top.is_empty() {
+            let marks = vec!["?"; top.len()].join(",");
+            let ids: Vec<JsValue> = top.iter().map(|(id, _)| n(*id)).collect();
+            for row in store::db(env)?
+                .prepare(format!(
+                    "SELECT id, slug, url, title FROM links WHERE id IN ({marks})"
+                ))
+                .bind(&ids)?
+                .all()
+                .await?
+                .results::<serde_json::Value>()?
+            {
+                if let Some(id) = row.get("id").and_then(|v| v.as_f64()) {
+                    info.insert(id as i64, row);
+                }
+            }
+        }
+        out["top_links"] = top
+            .into_iter()
+            .filter_map(|(id, cnt)| {
+                info.remove(&id).map(|mut row| {
+                    row["n"] = cnt.into();
+                    row
+                })
+            })
+            .take(10)
+            .collect::<Vec<_>>()
             .into();
+        let d = store::db(env)?;
+        let res = d
+            .batch(vec![
+                d.prepare("SELECT COUNT(*) AS n FROM links"),
+                d.prepare(format!(
+                    "SELECT COUNT(*) AS n FROM links WHERE disabled = 0 AND {}",
+                    crate::model::BROKEN_SQL
+                )),
+            ])
+            .await?;
+        let count = |i: usize| -> Result<i64> {
+            Ok(res[i]
+                .results::<CountRow>()?
+                .first()
+                .map(|c| c.n)
+                .unwrap_or(0))
+        };
+        out["links"] = count(0)?.into();
+        out["broken"] = count(1)?.into();
     }
     json(&out, 200)
+}
+
+/// What is switched on, for the settings page.
+async fn status(env: &Env) -> Result<Response> {
+    let last_backup: Option<serde_json::Value> = store::get_state(env, "last_backup")
+        .await?
+        .and_then(|v| serde_json::from_str(&v).ok());
+    json(
+        &serde_json::json!({
+            "analytics_engine": analytics::enabled(env),
+            "backups": backup::enabled(env),
+            "last_backup": last_backup,
+            "webhook_events": webhooks::EVENTS,
+        }),
+        200,
+    )
 }
 
 // ---- Export / maintenance ----

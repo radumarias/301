@@ -87,6 +87,27 @@ pub async fn verify_password(password: &str, stored: &str) -> bool {
     }
 }
 
+/// HMAC-SHA256 of `msg` with `key`.
+pub async fn hmac_sha256(key: &[u8], msg: &[u8]) -> worker::Result<Vec<u8>> {
+    let s = subtle()?;
+    let algo = obj(&[("name", "HMAC".into()), ("hash", "SHA-256".into())])?;
+    let usages = Array::of1(&JsValue::from_str("sign"));
+    let key = JsFuture::from(
+        s.import_key_with_object("raw", &Uint8Array::from(key), &algo, false, &usages)
+            .map_err(err)?,
+    )
+    .await
+    .map_err(err)?;
+    let key: CryptoKey = key.unchecked_into();
+    let sig = JsFuture::from(
+        s.sign_with_str_and_u8_array("HMAC", &key, msg)
+            .map_err(err)?,
+    )
+    .await
+    .map_err(err)?;
+    Ok(Uint8Array::new(&sig).to_vec())
+}
+
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
