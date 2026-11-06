@@ -32,6 +32,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let res = if path == "/_" || path.starts_with("/_/") {
         // The app itself is public; the API decides what each caller may do.
         ui::serve(&path)
+    } else if (path.starts_with("/auth/") || path.starts_with("/api/")) && !api::same_origin(&req) {
+        util::json_error("cross-origin request refused", 403)
     } else if path.starts_with("/auth/") {
         google::handle(req, env).await
     } else if path.starts_with("/api/") {

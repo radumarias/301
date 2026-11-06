@@ -5,9 +5,11 @@
 //! one needs a Turnstile pass, is limited per IP, and every destination is checked.
 
 use crate::account;
+use crate::api::body;
 use crate::auth;
+use crate::body;
 use crate::crypto::{random_token, token_hash};
-use crate::model::{validate_url, LinkInput};
+use crate::model::LinkInput;
 use crate::safety;
 use crate::store::{self, s, Settings};
 use crate::util::{json, json_error, now_ms};
@@ -22,7 +24,8 @@ fn anon_available(env: &Env, st: &Settings) -> bool {
 }
 
 pub async fn config(env: &Env) -> Result<Response> {
-    let st = store::settings(env).await.unwrap_or_default();
+    // Every page load asks for this: read settings from the edge cache, not D1.
+    let st = store::settings_cached(env).await;
     let site_key = auth::var(env, "TURNSTILE_SITE_KEY");
     json(
         &serde_json::json!({
@@ -52,10 +55,7 @@ pub async fn create(mut req: Request, env: &Env) -> Result<Response> {
             403,
         );
     }
-    let body: Create = match req.json().await {
-        Ok(b) => b,
-        Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-    };
+    let body: Create = body!(req);
     let ip = safety::client_ip(&req);
     if safety::turnstile_configured(env)
         && !safety::turnstile_ok(env, &body.turnstile, ip.as_deref()).await
@@ -74,36 +74,25 @@ pub async fn create(mut req: Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let url = body.url.trim().to_string();
-    if let Err(e) = validate_url(&url) {
-        return json_error(e, 400);
-    }
-    let host = req
-        .url()?
-        .host_str()
-        .map(str::to_string)
-        .unwrap_or_default();
-    if let Err(e) = safety::check_urls(env, &host, std::slice::from_ref(&url)).await {
-        return json_error(e, 400);
-    }
-
+    // Only a destination and a slug style: no custom slug or other options.
     let input = LinkInput {
-        url: Some(url),
-        slug_style: body
-            .slug_style
-            .filter(|s| ["random", "words", "names"].contains(&s.as_str())),
+        url: Some(body.url),
+        slug_style: body.slug_style,
         ..Default::default()
     };
     let mut link = match store::new_link(env, &st, &input, "anonymous").await {
         Ok(l) => l,
         Err(e) => return json_error(e.public_message(), 400),
     };
+    if let Err(e) = safety::check_link(env, &req, &link).await {
+        return json_error(e, 400);
+    }
     let token = random_token(24);
     link.expires_at = Some(link.created_at + st.anon_ttl_days * 24 * HOUR_MS);
     link.manage_hash = Some(token_hash(&token).await?);
     link.creator_ip = Some(ip_hash);
-    link.anonymous = true;
-    match store::insert_link(env, link).await {
+    // No eager KV write: unclicked links (spam included) cost no KV writes.
+    match store::insert_link(env, link, false).await {
         Ok(link) => json(
             &serde_json::json!({ "link": link, "manage_token": token }),
             201,
@@ -137,6 +126,10 @@ pub async fn manage(
         (Method::Get, [s]) if s == "stats" => {
             crate::api::stats(env, Some(link.id), range.unwrap_or("30d"), None).await
         }
+        (Method::Delete, []) if link.blocked => json_error(
+            "This link was blocked by an admin and cannot be deleted.",
+            403,
+        ),
         (Method::Delete, []) => match store::delete_links(env, &[link]).await {
             Ok(()) => json(&serde_json::json!({ "ok": true }), 200),
             Err(e) => json_error(e.public_message(), 500),
@@ -152,10 +145,7 @@ struct Report {
 }
 
 pub async fn report(mut req: Request, env: &Env) -> Result<Response> {
-    let body: Report = match req.json().await {
-        Ok(b) => b,
-        Err(e) => return json_error(format!("invalid JSON: {e}"), 400),
-    };
+    let body: Report = body!(req);
     let reason = body.reason.trim();
     if reason.is_empty() || reason.len() > 1000 {
         return json_error(

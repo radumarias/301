@@ -83,7 +83,7 @@ fn set_cookie(res: &mut Response, value: &str) -> Result<()> {
 }
 
 fn flow_cookie(value: &str, max_age: i64) -> String {
-    format!("{FLOW_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+    account::cookie_header(FLOW_COOKIE, value, max_age)
 }
 
 pub async fn handle(req: Request, env: Env) -> Result<Response> {
@@ -239,9 +239,6 @@ async fn callback(req: &Request, env: &Env) -> std::result::Result<Response, Str
 }
 
 async fn logout(req: Request, env: &Env) -> Result<Response> {
-    if !crate::api::same_origin(&req) {
-        return util::json_error("cross-origin request refused", 403);
-    }
     if let Some(token) = account::cookie(&req, SESSION_COOKIE) {
         account::end_session(env, &token).await?;
     }

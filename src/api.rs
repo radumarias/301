@@ -36,12 +36,15 @@ fn ok_json() -> serde_json::Value {
 }
 
 /// Parses a JSON request body, or produces the 400 response to return.
-async fn body<T: DeserializeOwned>(req: &mut Request) -> std::result::Result<T, Response> {
+pub(crate) async fn body<T: DeserializeOwned>(
+    req: &mut Request,
+) -> std::result::Result<T, Response> {
     req.json()
         .await
         .map_err(|e| json_error(format!("invalid JSON: {e}"), 400).unwrap())
 }
 
+#[macro_export]
 macro_rules! body {
     ($req:expr) => {
         match body(&mut $req).await {
@@ -64,62 +67,87 @@ pub fn same_origin(req: &Request) -> bool {
 }
 
 /// Links a caller may see: admins see all, everyone else only their own.
-pub fn visible(who: &Identity, link: &Link) -> bool {
-    who.admin || link.owner_id == Some(who.user_id)
+pub fn visible(who: &Identity, owner_id: Option<i64>) -> bool {
+    who.admin || owner_id == Some(who.user_id)
 }
 
-/// Loads a link the caller may see (404 otherwise, so ids of others' links are not confirmed).
-async fn owned(env: &Env, who: &Identity, id: i64) -> std::result::Result<Link, Response> {
-    match store::get_link(env, id).await {
-        Ok(Some(l)) if visible(who, &l) => Ok(l),
-        Ok(_) => Err(json_error("not found", 404).unwrap()),
-        Err(e) => Err(store_err(e.into()).unwrap()),
+/// What a caller may do with a link.
+#[derive(PartialEq)]
+enum Access {
+    Read,
+    /// Change or delete: owners cannot touch a link an admin blocked.
+    Write,
+}
+
+/// `Ok(Err(response))` when the caller may not access the link.
+fn may(
+    who: &Identity,
+    owner_id: Option<i64>,
+    blocked: bool,
+    access: Access,
+) -> Result<std::result::Result<(), Response>> {
+    if !visible(who, owner_id) {
+        // 404, so ids of other people's links are not confirmed.
+        return Ok(Err(json_error("not found", 404)?));
+    }
+    if access == Access::Write && blocked && !who.admin {
+        return Ok(Err(json_error(
+            "This link was blocked by an admin and cannot be changed.",
+            403,
+        )?));
+    }
+    Ok(Ok(()))
+}
+
+/// Loads a link the caller may access.
+async fn owned(
+    env: &Env,
+    who: &Identity,
+    id: i64,
+    access: Access,
+) -> Result<std::result::Result<Link, Response>> {
+    let Some(l) = store::get_link(env, id).await? else {
+        return Ok(Err(json_error("not found", 404)?));
+    };
+    Ok(may(who, l.owner_id, l.blocked, access)?.map(|_| l))
+}
+
+/// Checks access without loading the whole link.
+async fn check_access(
+    env: &Env,
+    who: &Identity,
+    id: i64,
+    access: Access,
+) -> Result<std::result::Result<(), Response>> {
+    match store::link_access(env, id).await? {
+        Some((owner, blocked)) => may(who, owner, blocked, access),
+        None => Ok(Err(json_error("not found", 404)?)),
     }
 }
 
+/// `owned!(env, who, id, Read|Write)` loads the link or returns the error response;
+/// `owned!(check env, who, id, ...)` only checks.
 macro_rules! owned {
-    ($env:expr, $who:expr, $id:expr) => {
-        match owned($env, $who, $id).await {
+    (check $env:expr, $who:expr, $id:expr, $access:ident) => {
+        if let Err(r) = check_access($env, $who, $id, Access::$access).await? {
+            return Ok(r);
+        }
+    };
+    ($env:expr, $who:expr, $id:expr, $access:ident) => {
+        match owned($env, $who, $id, Access::$access).await? {
             Ok(l) => l,
             Err(r) => return Ok(r),
         }
     };
 }
 
-/// Every destination a link can send visitors to.
-pub fn link_urls(l: &Link) -> Vec<String> {
-    let mut v = vec![l.url.clone()];
-    v.extend(l.fallback_url.clone());
-    v.extend(l.geo.values().cloned());
-    v.extend(
-        [&l.device.ios, &l.device.android, &l.device.desktop]
-            .into_iter()
-            .flatten()
-            .cloned(),
-    );
-    v.sort();
-    v.dedup();
-    v
-}
-
-fn own_host(req: &Request) -> String {
-    req.url()
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_default()
-}
-
-/// Safety checks for links saved by non-admins (admins are trusted).
+/// Destination checks for links saved by non-admins (admins are trusted).
 async fn check_destinations(
     env: &Env,
     req: &Request,
-    who: &Identity,
     link: &Link,
 ) -> std::result::Result<(), Response> {
-    if who.admin {
-        return Ok(());
-    }
-    safety::check_urls(env, &own_host(req), &link_urls(link))
+    safety::check_link(env, req, link)
         .await
         .map_err(|e| json_error(e, 400).unwrap())
 }
@@ -127,9 +155,6 @@ async fn check_destinations(
 const DAY_MS: i64 = 24 * 3_600_000;
 
 pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
-    if !same_origin(&req) {
-        return json_error("cross-origin request refused", 403);
-    }
     let url = req.url()?;
     let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
     let q = |k: &str| query.get(k).map(String::as_str);
@@ -200,8 +225,8 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["links"], _) => list_links(&env, &query, &who).await,
         (Method::Post, ["links"], _) => {
             let input: LinkInput = body!(req);
+            let st = store::settings(&env).await.unwrap_or_default();
             if let Some(uid) = scope {
-                let st = store::settings(&env).await.unwrap_or_default();
                 let made = account::created_since(&env, Some(uid), None, now_ms() - DAY_MS).await?;
                 if made >= st.user_per_day {
                     return json_error(
@@ -212,53 +237,53 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
                         429,
                     );
                 }
-                let mut probe = Link::new(302, "manual");
-                if let Err(e) = input.apply(&mut probe) {
-                    return json_error(e, 400);
-                }
-                if let Err(r) = check_destinations(&env, &req, &who, &probe).await {
+            }
+            let mut link = match store::new_link(&env, &st, &input, "manual").await {
+                Ok(l) => l,
+                Err(e) => return store_err(e),
+            };
+            if scope.is_some() {
+                if let Err(r) = check_destinations(&env, &req, &link).await {
                     return Ok(r);
                 }
             }
-            respond(
-                store::create_link(&env, &input, Some(who.user_id)).await,
-                201,
-            )
+            link.owner_id = Some(who.user_id);
+            respond(store::insert_link(&env, link, true).await, 201)
         }
         (Method::Post, ["links", "bulk"], _) => {
             let b: Bulk = body!(req);
             bulk(&env, b, &who).await
         }
-        (Method::Get, ["links", _], Some(id)) => json(&owned!(&env, &who, id), 200),
+        (Method::Get, ["links", _], Some(id)) => {
+            let mut link = owned!(&env, &who, id, Read);
+            if who.admin && link.owner_id.is_some() {
+                link.owner_email = account::email_of(&env, link.owner_id).await?;
+            }
+            json(&link, 200)
+        }
         (Method::Patch | Method::Put, ["links", _], Some(id)) => {
             let input: LinkInput = body!(req);
-            let link = owned!(&env, &who, id);
+            let mut link = owned!(&env, &who, id, Write);
+            let stmts = match store::prepare_update(&env, &mut link, &input).await {
+                Ok(s) => s,
+                Err(e) => return store_err(e),
+            };
             if !who.admin {
-                if link.blocked {
-                    return json_error(
-                        "This link was blocked by an admin and cannot be edited.",
-                        403,
-                    );
-                }
-                let mut probe = link.clone();
-                if let Err(e) = input.apply(&mut probe) {
-                    return json_error(e, 400);
-                }
-                if let Err(r) = check_destinations(&env, &req, &who, &probe).await {
+                if let Err(r) = check_destinations(&env, &req, &link).await {
                     return Ok(r);
                 }
             }
-            respond(store::update_loaded(&env, link, &input).await, 200)
+            respond(store::save_update(&env, link, stmts).await, 200)
         }
         (Method::Delete, ["links", _], Some(id)) => {
-            let link = owned!(&env, &who, id);
+            let link = owned!(&env, &who, id, Write);
             respond(
                 store::delete_links(&env, &[link]).await.map(|_| ok_json()),
                 200,
             )
         }
         (Method::Delete, ["links", _, "aliases", alias @ ..], Some(id)) => {
-            owned!(&env, &who, id);
+            owned!(check & env, &who, id, Write);
             respond(
                 store::delete_alias(&env, id, &alias.join("/"))
                     .await
@@ -267,11 +292,11 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             )
         }
         (Method::Get, ["links", _, "stats"], Some(id)) => {
-            owned!(&env, &who, id);
+            owned!(check & env, &who, id, Read);
             stats(&env, Some(id), q("range").unwrap_or("30d"), None).await
         }
         (Method::Get, ["links", _, "qr.svg"], Some(id)) => {
-            let link = owned!(&env, &who, id);
+            let link = owned!(&env, &who, id, Read);
             qr_svg(&url, &link, &query)
         }
         (Method::Get, ["slug"], _) => {
@@ -293,9 +318,9 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             let mut taken = store::slug_owner(&env, slug).await?;
             // Do not reveal the ids of other people's links.
             if let (Some(id), false) = (taken, who.admin) {
-                let mine = store::get_link(&env, id)
+                let mine = store::link_access(&env, id)
                     .await?
-                    .is_some_and(|l| visible(&who, &l));
+                    .is_some_and(|(owner, _)| visible(&who, owner));
                 if !mine {
                     taken = Some(-1);
                 }
@@ -396,11 +421,12 @@ async fn list_links(env: &Env, q: &HashMap<String, String>, who: &Identity) -> R
             wheres.push(format!("owner_id = ?{}", binds.len()));
         }
         "anon" => wheres.push("manage_hash IS NOT NULL".into()),
-        id if id.parse::<i64>().is_ok() => {
-            binds.push(n(id.parse().unwrap_or_default()));
-            wheres.push(format!("owner_id = ?{}", binds.len()));
+        id => {
+            if let Ok(id) = id.parse::<i64>() {
+                binds.push(n(id));
+                wheres.push(format!("owner_id = ?{}", binds.len()));
+            }
         }
-        _ => {}
     }
     if let Some(text) = q.get("q").map(|t| t.trim()).filter(|t| !t.is_empty()) {
         binds.push(s(&format!("%{text}%")));
@@ -465,8 +491,9 @@ async fn list_links(env: &Env, q: &HashMap<String, String>, who: &Identity) -> R
         .batch(vec![
             d.prepare(format!("SELECT COUNT(*) AS n FROM links {where_sql}")).bind(&binds)?,
             d.prepare(format!(
-                "SELECT {} FROM links {where_sql} ORDER BY {sort} {order}, id DESC LIMIT {limit} OFFSET {offset}",
-                store::LINK_COLS
+                "SELECT {}{} FROM links {where_sql} ORDER BY {sort} {order}, id DESC LIMIT {limit} OFFSET {offset}",
+                store::LINK_COLS,
+                if who.admin { format!(", {}", store::OWNER_EMAIL_COL) } else { String::new() }
             ))
             .bind(&binds)?,
         ])
@@ -551,7 +578,7 @@ async fn bulk(env: &Env, body: Bulk, who: &Identity) -> Result<Response> {
         links.extend(store::query_links(env, &format!("WHERE id IN ({marks})"), &ids).await?);
     }
     // Other people's links are silently left out; blocked ones stay as they are for users.
-    links.retain(|l| visible(who, l) && (who.admin || !l.blocked));
+    links.retain(|l| visible(who, l.owner_id) && (who.admin || !l.blocked));
     if links.is_empty() {
         return json(&serde_json::json!({ "done": 0, "errors": [] }), 200);
     }
@@ -721,24 +748,19 @@ async fn links_after(
     limit: i64,
     owner: Option<i64>,
 ) -> Result<Vec<Link>> {
-    let page = match owner {
-        Some(uid) => {
-            store::query_links(
-                env,
-                &format!("WHERE id > ?1 AND owner_id = ?2 ORDER BY id LIMIT {limit}"),
-                &[n(after_id), n(uid)],
-            )
-            .await?
-        }
-        None => {
-            store::query_links(
-                env,
-                &format!("WHERE id > ?1 ORDER BY id LIMIT {limit}"),
-                &[n(after_id)],
-            )
-            .await?
-        }
+    let mut binds = vec![n(after_id)];
+    binds.extend(owner.map(n));
+    let mine = if owner.is_some() {
+        " AND owner_id = ?2"
+    } else {
+        ""
     };
+    let page = store::query_links(
+        env,
+        &format!("WHERE id > ?1{mine} ORDER BY id LIMIT {limit}"),
+        &binds,
+    )
+    .await?;
     store::with_aliases(env, page).await
 }
 

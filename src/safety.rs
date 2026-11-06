@@ -2,6 +2,7 @@
 //! Google Safe Browsing, and Cloudflare Turnstile for anonymous creation.
 
 use crate::auth::var;
+use crate::model::Link;
 use serde::Deserialize;
 use std::net::IpAddr;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
@@ -95,12 +96,25 @@ pub async fn flagged(env: &Env, urls: &[String]) -> Option<String> {
     }
 }
 
-/// Local checks for every URL, then one Safe Browsing lookup for all of them.
-pub async fn check_urls(env: &Env, own_host: &str, urls: &[String]) -> Result<(), String> {
-    for u in urls {
-        local_check(u, own_host)?;
+/// The host this request was made to (the shortener's own host).
+pub fn own_host(req: &Request) -> String {
+    req.url()
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Checks every destination of a link saved by a non-admin: local checks for each URL,
+/// then one Safe Browsing lookup for all of them.
+pub async fn check_link(env: &Env, req: &Request, link: &Link) -> Result<(), String> {
+    let host = own_host(req);
+    let mut urls: Vec<String> = link.destinations().into_iter().map(String::from).collect();
+    urls.sort();
+    urls.dedup();
+    for u in &urls {
+        local_check(u, &host)?;
     }
-    if let Some(bad) = flagged(env, urls).await {
+    if let Some(bad) = flagged(env, &urls).await {
         return Err(format!(
             "{bad} is flagged as unsafe by Google Safe Browsing"
         ));

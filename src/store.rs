@@ -15,7 +15,11 @@ use worker::{D1Database, D1PreparedStatement, Env, KvStore};
 pub const KV_CACHE_TTL: u64 = 60;
 
 pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at, \
-     owner_id, manage_hash, creator_ip, blocked, (SELECT email FROM users WHERE users.id = links.owner_id) AS owner_email";
+     owner_id, manage_hash, creator_ip, blocked";
+
+/// Extra column for admin views: the owner's email (append to `LINK_COLS`).
+pub const OWNER_EMAIL_COL: &str =
+    "(SELECT email FROM users WHERE users.id = links.owner_id) AS owner_email";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -405,22 +409,19 @@ pub async fn new_link(env: &Env, st: &Settings, input: &LinkInput, source: &str)
     Ok(link)
 }
 
-pub async fn create_link(env: &Env, input: &LinkInput, owner_id: Option<i64>) -> SResult<Link> {
-    let st = settings(env).await.unwrap_or_default();
-    let mut link = new_link(env, &st, input, "manual").await?;
-    link.owner_id = owner_id;
-    insert_link(env, link).await
-}
-
-/// Saves a link built with `new_link` and writes its KV record.
-pub async fn insert_link(env: &Env, mut link: Link) -> SResult<Link> {
+/// Saves a link built with `new_link`. With `write_kv` its KV record is written now;
+/// otherwise the first click fills it (read-through), which costs no KV write for
+/// links nobody clicks.
+pub async fn insert_link(env: &Env, mut link: Link, write_kv: bool) -> SResult<Link> {
     let row = insert_stmt(&db(env)?, &link)?.first::<IdRow>(None).await?;
     link.id = row
         .ok_or_else(|| {
             StoreError::Internal(worker::Error::RustError("insert returned no id".into()))
         })?
         .id;
-    sync_kv(env, &link).await?;
+    if write_kv {
+        sync_kv(env, &link).await?;
+    }
     Ok(link.with_status())
 }
 
@@ -468,9 +469,29 @@ pub async fn prepare_update(
 
 pub async fn update_loaded(env: &Env, mut link: Link, input: &LinkInput) -> SResult<Link> {
     let stmts = prepare_update(env, &mut link, input).await?;
+    save_update(env, link, stmts).await
+}
+
+/// Runs the statements from `prepare_update` and refreshes the link's KV records.
+pub async fn save_update(env: &Env, link: Link, stmts: Vec<D1PreparedStatement>) -> SResult<Link> {
     db(env)?.batch(stmts).await?;
     sync_kv(env, &link).await?;
     Ok(link.with_status())
+}
+
+/// Owner and blocked flag of a link, without loading the whole row.
+pub async fn link_access(env: &Env, id: i64) -> worker::Result<Option<(Option<i64>, bool)>> {
+    #[derive(Deserialize)]
+    struct Row {
+        owner_id: Option<i64>,
+        blocked: i64,
+    }
+    Ok(db(env)?
+        .prepare("SELECT owner_id, blocked FROM links WHERE id = ?1")
+        .bind(&[n(id)])?
+        .first::<Row>(None)
+        .await?
+        .map(|r| (r.owner_id, r.blocked != 0)))
 }
 
 pub async fn update_link(env: &Env, id: i64, input: &LinkInput) -> SResult<Link> {

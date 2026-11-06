@@ -99,8 +99,8 @@ pub struct Link {
     /// Owner's email, filled when listing for an admin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    /// Created without an account; managed with a secret token.
-    #[serde(default)]
+    /// Created without an account; managed with a secret token (derived from `manage_hash`).
+    #[serde(default, skip_deserializing)]
     pub anonymous: bool,
     #[serde(skip)]
     pub manage_hash: Option<String>,
@@ -127,7 +127,22 @@ impl Link {
 
     pub fn with_status(mut self) -> Self {
         self.status = self.status(crate::util::now_ms());
+        self.anonymous = self.manage_hash.is_some();
         self
+    }
+
+    /// Every URL the link can send visitors to (default, fallback, geo and device rules).
+    pub fn destinations(&self) -> Vec<&str> {
+        std::iter::once(self.url.as_str())
+            .chain(self.fallback_url.as_deref())
+            .chain(self.geo.values().map(String::as_str))
+            .chain(
+                [&self.device.ios, &self.device.android, &self.device.desktop]
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .collect()
     }
 
     /// Whether visitors can currently follow the link.
@@ -216,7 +231,7 @@ impl From<LinkRow> for Link {
             aliases: vec![],
             owner_id: r.owner_id,
             owner_email: r.owner_email,
-            anonymous: r.manage_hash.is_some(),
+            anonymous: false,
             manage_hash: r.manage_hash,
             creator_ip: r.creator_ip,
             blocked: r.blocked.unwrap_or(0) != 0,
@@ -387,21 +402,13 @@ impl LinkInput {
 }
 
 pub fn validate_link(link: &Link) -> Result<(), String> {
-    validate_url(&link.url)?;
     validate_redirect_type(link.redirect_type)?;
-    if let Some(f) = &link.fallback_url {
-        validate_url(f)?;
-    }
-    for (cc, u) in &link.geo {
+    for cc in link.geo.keys() {
         if cc.len() != 2 || !cc.chars().all(|c| c.is_ascii_uppercase()) {
             return Err(format!("geo key must be a 2-letter country code: {cc}"));
         }
-        validate_url(u)?;
     }
-    for u in [&link.device.ios, &link.device.android, &link.device.desktop]
-        .into_iter()
-        .flatten()
-    {
+    for u in link.destinations() {
         validate_url(u)?;
     }
     if link.title.as_ref().is_some_and(|t| t.len() > 512) {

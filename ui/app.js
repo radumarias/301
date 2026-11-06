@@ -790,6 +790,7 @@ async function moderationPage() {
 const ANON_KEY = "anon-links";
 function anonList() { try { return JSON.parse(localStorage.getItem(ANON_KEY) || "[]"); } catch { return []; } }
 function anonSave(list) { try { localStorage.setItem(ANON_KEY, JSON.stringify(list.slice(0, 200))); } catch {} }
+const forgetAnon = (token) => anonSave(anonList().filter((a) => a.token !== token));
 const manageUrl = (token) => `${ORIGIN}/_/#/m/${token}`;
 const signInUrl = (next = "/_/") => `/auth/login?next=${encodeURIComponent(next)}`;
 
@@ -877,19 +878,19 @@ async function managePage(token) {
   let link;
   try { link = await api("GET", `/anon/${token}`); }
   catch (e) {
-    anonSave(anonList().filter((a) => a.token !== token));
+    forgetAnon(token);
     $app.replaceChildren(h("div", { class: "hero panel" }, h("h2", {}, "Link not found"), h("p", { class: "muted" }, e.message), h("a", { class: "btn", href: "#/" }, "Back")));
     return;
   }
   async function del() {
     if (!confirm(`Delete /${link.slug}? It stops working right away.`)) return;
-    try { await api("DELETE", `/anon/${token}`); anonSave(anonList().filter((a) => a.token !== token)); toast("Deleted"); location.hash = "#/"; }
+    try { await api("DELETE", `/anon/${token}`); forgetAnon(token); toast("Deleted"); location.hash = "#/"; }
     catch (e) { toast(e.message, true); }
   }
   async function claim() {
     try {
       const r = await api("POST", "/claim", { tokens: [token] });
-      anonSave(anonList().filter((a) => a.token !== token));
+      forgetAnon(token);
       toast(r.claimed ? "Moved to your account" : "Nothing to move");
       location.hash = "#/links";
     } catch (e) { toast(e.message, true); }
@@ -966,12 +967,10 @@ function applyTheme() {
 
 async function boot() {
   applyTheme();
-  try { CFG = await api("GET", "/config"); } catch {}
-  try { ME = await api("GET", "/me"); }
-  catch (e) {
-    ME = null;
-    if (e.status === 403 || e.status === 503) toast(e.message, true);
-  }
+  const [cfg, me] = await Promise.allSettled([api("GET", "/config"), api("GET", "/me")]);
+  if (cfg.status === "fulfilled") CFG = cfg.value;
+  ME = me.status === "fulfilled" ? me.value : null;
+  if (me.status === "rejected" && [403, 503].includes(me.reason.status)) toast(me.reason.message, true);
   renderHeader();
   if (ME) await claimDeviceLinks();
   render();

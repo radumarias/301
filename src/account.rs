@@ -28,14 +28,16 @@ pub async fn server_secret(env: &Env) -> worker::Result<Vec<u8>> {
         value: String,
     }
     let d = db(env)?;
-    d.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('secret', ?1)")
-        .bind(&[s(&b64url(&random_bytes(32)))])?
-        .run()
+    let res = d
+        .batch(vec![
+            d.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('secret', ?1)")
+                .bind(&[s(&b64url(&random_bytes(32)))])?,
+            d.prepare("SELECT value FROM settings WHERE key = 'secret'"),
+        ])
         .await?;
-    let row = d
-        .prepare("SELECT value FROM settings WHERE key = 'secret'")
-        .first::<Row>(None)
-        .await?
+    let row = res[1]
+        .results::<Row>()?
+        .pop()
         .ok_or_else(|| worker::Error::RustError("server secret missing".into()))?;
     let key = row.value.into_bytes();
     SECRET.with(|c| *c.borrow_mut() = Some(key.clone()));
@@ -103,6 +105,20 @@ pub async fn user_id_for_email(env: &Env, email: &str) -> worker::Result<i64> {
     Ok(row.id)
 }
 
+pub async fn email_of(env: &Env, user_id: Option<i64>) -> worker::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Row {
+        email: String,
+    }
+    let Some(id) = user_id else { return Ok(None) };
+    Ok(db(env)?
+        .prepare("SELECT email FROM users WHERE id = ?1")
+        .bind(&[n(id)])?
+        .first::<Row>(None)
+        .await?
+        .map(|r| r.email))
+}
+
 /// Starts a session and returns the cookie value (only its hash is stored).
 pub async fn create_session(env: &Env, user_id: i64) -> worker::Result<String> {
     let token = random_token(32);
@@ -145,8 +161,13 @@ pub async fn end_session(env: &Env, token: &str) -> worker::Result<()> {
     Ok(())
 }
 
+/// A `__Host-` cookie: HTTPS only, not readable by scripts, sent on top-level navigation.
+pub fn cookie_header(name: &str, value: &str, max_age_s: i64) -> String {
+    format!("{name}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age_s}")
+}
+
 pub fn session_cookie(token: &str, max_age_s: i64) -> String {
-    format!("{SESSION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age_s}")
+    cookie_header(SESSION_COOKIE, token, max_age_s)
 }
 
 /// Reads a cookie from a request.
