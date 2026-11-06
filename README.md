@@ -66,3 +66,9 @@ open http://localhost:8787/_/
 On the Workers free plan the limiting factor is D1 writes (2 per human click), so roughly 50,000 clicks a day.
 The $5/month Workers Paid plan covers about 25 million clicks a month. Imports write no KV entries; each
 link's edge record is filled on its first click.
+
+The public redirect path is rate limited per IP (100 requests a minute by default, set in the
+`[[ratelimits]]` block of `wrangler.toml`). Over the limit a visitor gets a `429` before any KV read or
+D1 write, which also slows down password guessing on protected links. The admin (`/_/`, `/api/`) is not
+limited. The Worker request itself is still counted; to drop abusive traffic before it reaches the Worker,
+add a WAF rate-limiting rule once the shortener is on a custom domain (WAF rules do not run on workers.dev).
