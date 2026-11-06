@@ -467,11 +467,6 @@ pub async fn prepare_update(
     Ok(stmts)
 }
 
-pub async fn update_loaded(env: &Env, mut link: Link, input: &LinkInput) -> SResult<Link> {
-    let stmts = prepare_update(env, &mut link, input).await?;
-    save_update(env, link, stmts).await
-}
-
 /// Runs the statements from `prepare_update` and refreshes the link's KV records.
 pub async fn save_update(env: &Env, link: Link, stmts: Vec<D1PreparedStatement>) -> SResult<Link> {
     db(env)?.batch(stmts).await?;
@@ -494,11 +489,6 @@ pub async fn link_access(env: &Env, id: i64) -> worker::Result<Option<(Option<i6
         .map(|r| (r.owner_id, r.blocked != 0)))
 }
 
-pub async fn update_link(env: &Env, id: i64, input: &LinkInput) -> SResult<Link> {
-    let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    update_loaded(env, link, input).await
-}
-
 /// Deletes links (with their aliases and clicks) and their KV records.
 pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
     let d = db(env)?;
@@ -508,7 +498,6 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
         let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
         for table in [
             "clicks WHERE link_id",
-            "reports WHERE link_id",
             "aliases WHERE link_id",
             "links WHERE id",
         ] {
@@ -524,11 +513,6 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
         .flat_map(|l| std::iter::once(l.slug.as_str()).chain(l.aliases.iter().map(String::as_str)))
         .collect();
     forget_kv(env, &slugs).await
-}
-
-pub async fn delete_link(env: &Env, id: i64) -> SResult<()> {
-    let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    delete_links(env, &[link]).await
 }
 
 pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {

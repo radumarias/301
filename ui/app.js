@@ -878,8 +878,9 @@ async function managePage(token) {
   let link;
   try { link = await api("GET", `/anon/${token}`); }
   catch (e) {
-    forgetAnon(token);
-    $app.replaceChildren(h("div", { class: "hero panel" }, h("h2", {}, "Link not found"), h("p", { class: "muted" }, e.message), h("a", { class: "btn", href: "#/" }, "Back")));
+    // Only a 404 means the token is dead; keep it on network errors, 429s or 5xx.
+    if (e.status === 404) forgetAnon(token);
+    $app.replaceChildren(h("div", { class: "hero panel" }, h("h2", {}, e.status === 404 ? "Link not found" : "Could not load the link"), h("p", { class: "muted" }, e.message), h("a", { class: "btn", href: "#/" }, "Back")));
     return;
   }
   async function del() {
@@ -950,13 +951,19 @@ function renderHeader() {
 
 /// Anonymous links made on this device before signing in move to the account.
 async function claimDeviceLinks() {
-  const list = anonList();
-  if (!list.length) return;
+  // The server takes at most 50 tokens per call: send them in chunks and only forget
+  // the ones that were sent, so a failure keeps the rest for the next sign-in.
+  let list = anonList();
+  let claimed = 0;
   try {
-    const r = await api("POST", "/claim", { tokens: list.map((a) => a.token) });
-    anonSave([]);
-    if (r.claimed) toast(`Moved ${r.claimed} link${r.claimed === 1 ? "" : "s"} you made without an account to your account`);
+    while (list.length) {
+      const r = await api("POST", "/claim", { tokens: list.slice(0, 50).map((a) => a.token) });
+      claimed += r.claimed || 0;
+      list = list.slice(50);
+      anonSave(list);
+    }
   } catch {}
+  if (claimed) toast(`Moved ${claimed} link${claimed === 1 ? "" : "s"} you made without an account to your account`);
 }
 
 function applyTheme() {

@@ -69,6 +69,7 @@ Until `GOOGLE_CLIENT_ID` is set, the app stays admin-only behind Cloudflare Acce
    `TURNSTILE_SECRET`, `SAFE_BROWSING_KEY`. Make sure the `ADMIN_EMAILS` variable holds the Google address you sign in with.
 5. Re-run the deploy. The provision step deletes the "301 admin" Access application (the app has to be public now),
    the secrets are uploaded, and the first admin to sign in becomes the owner of every link made before accounts existed.
+   Access service tokens (`ADMIN_SERVICE_TOKENS`) stop working at that point, since Access is gone.
 
 Settings → Public access turns anonymous links off (a kill switch) and sets their lifetime and the creation limits.
 Moderation lists reports and users: block a link (visitors get a 410 and the owner cannot re-enable it) or ban an account.

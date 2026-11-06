@@ -71,6 +71,9 @@ if [[ -n "${GOOGLE_CLIENT_ID:-}" ]]; then
   ACCESS_TEAM_DOMAIN=""
   ACCESS_AUD=""
   SKIP_ACCESS=1
+  if [[ -n "${ADMIN_SERVICE_TOKENS:-}" ]]; then
+    echo "   warning: ADMIN_SERVICE_TOKENS no longer work without Cloudflare Access" >&2
+  fi
 fi
 
 if [[ -z "${SKIP_ACCESS:-}" ]]; then

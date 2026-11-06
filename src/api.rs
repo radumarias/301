@@ -264,11 +264,18 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Patch | Method::Put, ["links", _], Some(id)) => {
             let input: LinkInput = body!(req);
             let mut link = owned!(&env, &who, id, Write);
+            let before: Vec<String> = link.destinations().into_iter().map(String::from).collect();
             let stmts = match store::prepare_update(&env, &mut link, &input).await {
                 Ok(s) => s,
                 Err(e) => return store_err(e),
             };
-            if !who.admin {
+            // Only re-check (Safe Browsing is a network call) when a destination changed.
+            if !who.admin
+                && link
+                    .destinations()
+                    .into_iter()
+                    .ne(before.iter().map(String::as_str))
+            {
                 if let Err(r) = check_destinations(&env, &req, &link).await {
                     return Ok(r);
                 }
@@ -445,13 +452,14 @@ async fn list_links(env: &Env, q: &HashMap<String, String>, who: &Identity) -> R
     let now_bind = format!("?{}", binds.len() + 1);
     let expired = EXPIRED_SQL.replace('?', &now_bind);
     match q.get("status").map(String::as_str) {
-        Some("disabled") => wheres.push("disabled = 1".into()),
+        // Mirrors `Link::status`: blocked wins over disabled and expired.
+        Some("disabled") => wheres.push("blocked = 0 AND disabled = 1".into()),
         Some("blocked") => wheres.push("blocked = 1".into()),
         Some("reported") => wheres.push(
             "EXISTS (SELECT 1 FROM reports WHERE reports.link_id = links.id AND reports.resolved = 0)".into(),
         ),
-        Some("expired") => wheres.push(format!("disabled = 0 AND {expired}")),
-        Some("active") => wheres.push(format!("disabled = 0 AND NOT {expired}")),
+        Some("expired") => wheres.push(format!("blocked = 0 AND disabled = 0 AND {expired}")),
+        Some("active") => wheres.push(format!("blocked = 0 AND disabled = 0 AND NOT {expired}")),
         Some("protected") => wheres.push("password_hash IS NOT NULL".into()),
         _ => {}
     }

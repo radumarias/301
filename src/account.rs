@@ -73,6 +73,14 @@ pub async fn upsert_google_user(
             // An account first seen through Cloudflare Access (no Google id yet) is linked.
             d.prepare("UPDATE users SET google_sub = ?1 WHERE email = ?2 AND google_sub IS NULL")
                 .bind(&[s(sub), s(email)])?,
+            // A different Google account now owns this address (account deleted and
+            // recreated, or the address moved): the old account keeps its links but
+            // releases the email, so the new one starts fresh instead of taking them over.
+            d.prepare(
+                "UPDATE users SET email = email || '#replaced-' || id \
+                 WHERE email = ?2 AND google_sub IS NOT NULL AND google_sub != ?1",
+            )
+            .bind(&[s(sub), s(email)])?,
             d.prepare(
                 "INSERT INTO users (google_sub, email, name, created_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?4) \
                  ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, name = excluded.name, last_login_at = excluded.last_login_at \
@@ -81,7 +89,7 @@ pub async fn upsert_google_user(
             .bind(&[s(sub), s(email), os(&name), n(now)])?,
         ])
         .await?;
-    res[1]
+    res[2]
         .results::<User>()?
         .pop()
         .ok_or_else(|| worker::Error::RustError("user upsert returned nothing".into()))

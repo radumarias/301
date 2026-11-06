@@ -147,7 +147,8 @@ struct Report {
 pub async fn report(mut req: Request, env: &Env) -> Result<Response> {
     let body: Report = body!(req);
     let reason = body.reason.trim();
-    if reason.is_empty() || reason.len() > 1000 {
+    // Characters, like the form's maxlength, not bytes.
+    if reason.is_empty() || reason.chars().count() > 1000 {
         return json_error(
             "Tell us briefly what is wrong (up to 1000 characters).",
             400,

@@ -209,7 +209,14 @@ pub fn generate(style: Style, length: usize, attempt: usize) -> String {
     }
 }
 
-const RESERVED: &[&str] = &["_", "api", "robots.txt", "favicon.ico", "favicon.svg"];
+const RESERVED: &[&str] = &[
+    "_",
+    "api",
+    "auth",
+    "robots.txt",
+    "favicon.ico",
+    "favicon.svg",
+];
 
 /// Trims whitespace and surrounding slashes; `None` when nothing is left.
 pub fn normalize(s: &str) -> Option<String> {
@@ -231,7 +238,11 @@ pub fn validate(slug: &str) -> Result<(), String> {
     if slug.starts_with('/') || slug.ends_with('/') || slug.contains("//") || slug.contains("..") {
         return Err("slug may not start or end with '/', or contain '//' or '..'".into());
     }
-    if RESERVED.contains(&slug) || slug.starts_with("_/") || slug.starts_with("api/") {
+    if RESERVED.contains(&slug)
+        || slug.starts_with("_/")
+        || slug.starts_with("api/")
+        || slug.starts_with("auth/")
+    {
         return Err("slug is reserved".into());
     }
     Ok(())
@@ -250,6 +261,7 @@ mod tests {
         assert!(validate("api").is_err());
         assert!(validate("api/x").is_err());
         assert!(validate("_/x").is_err());
+        assert!(validate("auth/login").is_err());
         assert!(validate("a b").is_err());
         assert!(validate("/a").is_err());
         assert!(validate("a//b").is_err());
