@@ -6,9 +6,11 @@
 use crate::model::validate_url;
 use crate::store::{self, n, on, os, s, SResult, StoreError};
 use crate::util::{self, hex, now_ms};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
+use std::rc::Rc;
 use worker::{Env, Headers, Method, Request, RequestInit};
 
 pub const EVENTS: [&str; 4] = ["link.created", "link.updated", "link.deleted", "click"];
@@ -21,6 +23,8 @@ const CACHE_MS: i64 = 60_000;
 pub struct Hook {
     pub id: i64,
     pub url: String,
+    /// Stored as a JSON array in a TEXT column.
+    #[serde(deserialize_with = "json_text")]
     pub events: Vec<String>,
     pub secret: String,
     pub created_at: i64,
@@ -29,30 +33,14 @@ pub struct Hook {
     pub last_at: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct Row {
-    id: i64,
-    url: String,
-    events: String,
-    secret: String,
-    created_at: i64,
-    last_status: Option<i64>,
-    last_error: Option<String>,
-    last_at: Option<i64>,
+fn json_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(serde_json::from_str(&s).unwrap_or_default())
 }
 
-impl From<Row> for Hook {
-    fn from(r: Row) -> Self {
-        Hook {
-            id: r.id,
-            url: r.url,
-            events: serde_json::from_str(&r.events).unwrap_or_default(),
-            secret: r.secret,
-            created_at: r.created_at,
-            last_status: r.last_status,
-            last_error: r.last_error,
-            last_at: r.last_at,
-        }
+impl Hook {
+    fn wants(&self, event: &str) -> bool {
+        self.events.iter().any(|e| e == event)
     }
 }
 
@@ -64,23 +52,24 @@ pub struct HookInput {
 }
 
 thread_local! {
-    static CACHE: RefCell<Option<(i64, Vec<Hook>)>> = const { RefCell::new(None) };
+    static CACHE: RefCell<Option<(i64, Rc<Vec<Hook>>)>> = const { RefCell::new(None) };
 }
 
 fn invalidate() {
     CACHE.with(|c| *c.borrow_mut() = None);
 }
 
+const COLS: &str = "id, url, events, secret, created_at, last_status, last_error, last_at";
+
 pub async fn list(env: &Env) -> worker::Result<Vec<Hook>> {
-    let rows = store::db(env)?
-        .prepare("SELECT id, url, events, secret, created_at, last_status, last_error, last_at FROM webhooks ORDER BY id")
+    store::db(env)?
+        .prepare(format!("SELECT {COLS} FROM webhooks ORDER BY id"))
         .all()
         .await?
-        .results::<Row>()?;
-    Ok(rows.into_iter().map(Hook::from).collect())
+        .results::<Hook>()
 }
 
-async fn cached(env: &Env) -> Vec<Hook> {
+async fn cached(env: &Env) -> Rc<Vec<Hook>> {
     let now = now_ms();
     if let Some(hooks) = CACHE.with(|c| {
         c.borrow()
@@ -91,7 +80,7 @@ async fn cached(env: &Env) -> Vec<Hook> {
         return hooks;
     }
     // A missing table (migration not applied yet) just means "no hooks".
-    let hooks = list(env).await.unwrap_or_default();
+    let hooks = Rc::new(list(env).await.unwrap_or_default());
     CACHE.with(|c| *c.borrow_mut() = Some((now, hooks.clone())));
     hooks
 }
@@ -112,30 +101,21 @@ pub fn validate(input: &HookInput) -> Result<Vec<String>, String> {
 
 pub async fn create(env: &Env, input: &HookInput) -> SResult<Hook> {
     let events = validate(input).map_err(StoreError::Bad)?;
-    let secret = hex(&crate::crypto::random_bytes(24));
-    let now = now_ms();
-    let row = store::db(env)?
-        .prepare("INSERT INTO webhooks (url, events, secret, created_at) VALUES (?1, ?2, ?3, ?4) RETURNING id")
+    let hook = store::db(env)?
+        .prepare(format!(
+            "INSERT INTO webhooks (url, events, secret, created_at) VALUES (?1, ?2, ?3, ?4) RETURNING {COLS}"
+        ))
         .bind(&[
             s(input.url.trim()),
             s(&serde_json::to_string(&events).unwrap_or_default()),
-            s(&secret),
-            n(now),
+            s(&hex(&crate::crypto::random_bytes(24))),
+            n(now_ms()),
         ])?
-        .first::<store::IdRow>(None)
+        .first::<Hook>(None)
         .await?
         .ok_or(StoreError::NotFound)?;
     invalidate();
-    Ok(Hook {
-        id: row.id,
-        url: input.url.trim().to_string(),
-        events,
-        secret,
-        created_at: now,
-        last_status: None,
-        last_error: None,
-        last_at: None,
-    })
+    Ok(hook)
 }
 
 pub async fn delete(env: &Env, id: i64) -> SResult<()> {
@@ -178,51 +158,75 @@ pub async fn deliver(hook: &Hook, event: &str, data: &Value) -> (i64, Option<Str
     match send.await {
         Ok(code) if (200..300).contains(&code) => (code as i64, None),
         Ok(code) => (code as i64, Some(format!("HTTP {code}"))),
-        Err(e) => (0, Some(e.to_string().chars().take(300).collect())),
+        Err(e) => (0, Some(util::snippet(&e.to_string()))),
     }
 }
 
-async fn record(env: &Env, id: i64, status: i64, error: &Option<String>) {
-    if let Ok(d) = store::db(env) {
-        if let Ok(stmt) = d
-            .prepare(
+/// Delivers to every hook in `hooks` that wants `event`, all at once.
+async fn deliver_all(hooks: &[Hook], event: &str, data: &Value) -> Vec<(i64, i64, Option<String>)> {
+    let targets: Vec<&Hook> = hooks.iter().filter(|h| h.wants(event)).collect();
+    let results = join_all(targets.iter().map(|h| deliver(h, event, data))).await;
+    targets
+        .iter()
+        .zip(results)
+        .map(|(h, (status, error))| (h.id, status, error))
+        .collect()
+}
+
+/// Stores the delivery outcomes in one D1 batch.
+async fn record(env: &Env, outcomes: &[(i64, i64, Option<String>)]) -> worker::Result<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let d = store::db(env)?;
+    let now = now_ms();
+    let mut stmts = vec![];
+    for (id, status, error) in outcomes {
+        stmts.push(
+            d.prepare(
                 "UPDATE webhooks SET last_status = ?2, last_error = ?3, last_at = ?4 WHERE id = ?1",
             )
-            .bind(&[n(id), n(status), os(error), on(Some(now_ms()))])
-        {
-            let _ = stmt.run().await;
-        }
+            .bind(&[n(*id), n(*status), os(error), on(Some(now))])?,
+        );
+    }
+    d.batch(stmts).await?;
+    Ok(())
+}
+
+/// Sends a link event (`link.created` ...) for each link, with one hook lookup and
+/// one status write for the whole set. Call it from `wait_until`.
+pub async fn fire_links(env: &Env, event: &str, links: Vec<Value>) {
+    let hooks = list(env).await.unwrap_or_default();
+    if !hooks.iter().any(|h| h.wants(event)) {
+        return;
+    }
+    let mut outcomes = vec![];
+    for data in &links {
+        outcomes.extend(deliver_all(&hooks, event, data).await);
+    }
+    // Keep the last outcome per hook.
+    outcomes.reverse();
+    outcomes.dedup_by_key(|o| o.0);
+    if let Err(e) = record(env, &outcomes).await {
+        worker::console_error!("webhook status write failed: {e}");
     }
 }
 
-/// Delivers an event to every hook subscribed to it. Call it from `wait_until`.
-/// The delivery status is stored for link events; for clicks only failures are, so
-/// a busy link does not turn every click back into a D1 write.
-pub async fn fire(env: &Env, event: &str, data: Value) {
-    let hooks: Vec<Hook> = if event == "click" {
-        cached(env).await
-    } else {
-        list(env).await.unwrap_or_default()
-    };
-    let targets: Vec<&Hook> = hooks
-        .iter()
-        .filter(|h| h.events.iter().any(|e| e == event))
-        .collect();
-    let results =
-        futures_util::future::join_all(targets.iter().map(|h| deliver(h, event, &data))).await;
-    for (h, (status, error)) in targets.iter().zip(results) {
-        if event != "click" || error.is_some() {
-            record(env, h.id, status, &error).await;
-        }
+/// Sends a `click` event. Hooks come from the in-isolate cache, and only failures
+/// are stored, so a busy link does not turn every click back into a D1 write.
+pub async fn fire_click(env: &Env, click: &crate::store::Click) {
+    let hooks = cached(env).await;
+    if !hooks.iter().any(|h| h.wants("click")) {
+        return;
     }
-}
-
-/// True when some hook wants click events (checked from the in-isolate cache).
-pub async fn wants_clicks(env: &Env) -> bool {
-    cached(env)
+    let mut data = serde_json::to_value(click).unwrap_or_default();
+    data["link"] = serde_json::json!({ "id": click.link_id, "slug": click.slug });
+    let failed: Vec<_> = deliver_all(&hooks, "click", &data)
         .await
-        .iter()
-        .any(|h| h.events.iter().any(|e| e == "click"))
+        .into_iter()
+        .filter(|o| o.2.is_some())
+        .collect();
+    let _ = record(env, &failed).await;
 }
 
 #[cfg(test)]

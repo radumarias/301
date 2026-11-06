@@ -165,17 +165,20 @@ function rangePicker(current, onPick) {
   return h("div", { class: "seg" }, ["24h", "7d", "30d", "90d", "all"].map((r) =>
     h("button", { class: r === current ? "on" : "", onclick: () => onPick(r) }, r)));
 }
+// Panels shared by the dashboard and the link page; `L` (the link) adds A/B results.
 function statsBlock(st, L) {
   const t = st.top || {};
-  const variantName = (k) => { const i = Number(k); return `${String.fromCharCode(65 + i)} · ${i === 0 ? L.url : (L.variants[i - 1] || {}).url || "removed variant"}`; };
-  return [
-    st.analytics_error && h("div", { class: "panel" }, h("p", { class: "bad small", style: "margin:0" }, st.analytics_error)),
-    L && L.variants && L.variants.length > 0 && bars("A/B variants", (t.variant || []).map((r) => ({ k: variantName(r.k), n: r.n }))),
-    h("div", { class: "panel" }, lineChart(st.series || [], st.bucket_ms, st.since)),
-    h("div", { class: "grid g3" },
+  // Clicks record the destination served, so labels survive edits of the split.
+  const letters = L ? [L.url, ...L.variants.map((v) => v.url)].map((u) => applyUtm(u, L.utm || {})) : [];
+  const variantName = (k) => { const i = letters.indexOf(k); return i < 0 ? `earlier variant · ${k}` : `${String.fromCharCode(65 + i)} · ${k}`; };
+  return {
+    note: st.analytics_error && h("div", { class: "panel" }, h("p", { class: "bad small", style: "margin:0" }, st.analytics_error)),
+    variants: (t.variant || []).length > 0 && bars("A/B variants", t.variant.map((r) => ({ k: variantName(r.k), n: r.n }))),
+    chart: h("div", { class: "panel" }, lineChart(st.series || [], st.bucket_ms, st.since)),
+    dims: h("div", { class: "grid g3" },
       bars("Countries", t.country || []), bars("Referrers", t.referrer || []), bars("Devices", t.device || []),
       bars("Operating systems", t.os || []), bars("Browsers", t.browser || []), bars("Cities", t.city || [])),
-  ];
+  };
 }
 
 // ---------- dashboard ----------
@@ -183,7 +186,7 @@ async function dashboard() {
   const range = sessionStorage.getItem("range") || "30d";
   const st = await api("GET", `/stats?range=${range}`);
   const pick = (r) => { sessionStorage.setItem("range", r); render(); };
-  const [note, , chart, dims] = statsBlock(st);
+  const { note, chart, dims } = statsBlock(st);
   $app.replaceChildren(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Dashboard"), h("div", { class: "muted" }, "Human clicks; bots and link previews are counted separately.")), rangePicker(range, pick)),
     h("div", { class: "grid g4", style: "margin-bottom:16px" },
@@ -445,12 +448,12 @@ async function editPage(id) {
       expires_at: fromLocalInput(f.expires.value),
       max_clicks: f.max.value ? Number(f.max.value) : null,
       fallback_url: f.fallback.value.trim() || null,
-      utm: Object.fromEntries(Object.entries(utm).map(([k, e]) => [k, e.value.trim() || null])),
+      utm: vals(utm),
       geo,
-      device: Object.fromEntries(Object.entries(dev).map(([k, e]) => [k, e.value.trim() || null])),
-      og: Object.fromEntries(Object.entries(og).map(([k, e]) => [k, e.value.trim() || null])),
+      device: vals(dev),
+      og: vals(og),
       variants: [...varBox.querySelectorAll(".rule")].map((r) => ({ url: r.querySelector(".var-url").value.trim(), weight: Number(r.querySelector(".var-w").value) || 0 })).filter((v) => v.url),
-      app: Object.fromEntries(Object.entries(app).map(([k, e]) => [k, e.value.trim() || null])),
+      app: vals(app),
     };
     const slugV = f.slug.value.trim();
     if (slugV) body.slug = slugV; else if (isNew) body.slug_style = styleSel.value;
@@ -482,11 +485,12 @@ async function editPage(id) {
       h("button", { class: "btn sm", onclick: async () => { await api("DELETE", `/links/${L.id}/aliases/${a.split("/").map(encodeURIComponent).join("/")}`); toast("Alias removed"); editPage(L.id); } }, "Remove")))
       : h("p", { class: "muted small" }, "Renaming the slug keeps the old one working as an alias."));
   const healthLine = h("p", { class: "small" }, L.health ? healthText(L.health) : "Not checked yet. Destinations are checked about once a day.");
-  if (L.health && L.health.broken) healthLine.classList.add("bad");
+  const showHealth = (hl) => { healthLine.textContent = healthText(hl); healthLine.className = "small" + (hl.broken ? " bad" : " ok"); };
+  if (L.health) showHealth(L.health);
   const healthPanel = h("div", { class: "panel" }, h("h2", {}, "Destination health"), healthLine,
     h("button", { class: "btn sm", onclick: async (e) => {
       e.target.disabled = true;
-      try { const r = await api("POST", `/links/${L.id}/check`); healthLine.textContent = healthText(r); healthLine.className = "small" + (r.broken ? " bad" : " ok"); }
+      try { showHealth(await api("POST", `/links/${L.id}/check`)); }
       catch (err) { toast(err.message, true); }
       e.target.disabled = false;
     } }, "Check now"));
@@ -498,7 +502,7 @@ async function editPage(id) {
     statsWrap.replaceChildren(
       h("div", { class: "page-head", style: "margin:8px 0 0" }, h("h2", { style: "margin:0" }, "Analytics"), rangePicker(r, loadStats)),
       h("div", { class: "grid g4" }, stat("Clicks", st.clicks), stat("QR scans", st.qr), stat("Bot hits", st.bots), stat("All-time clicks", L.clicks)),
-      ...statsBlock(st, L).filter(Boolean));
+      ...Object.values(statsBlock(st, L)).filter(Boolean));
   }
   $app.replaceChildren(
     h("div", { class: "page-head" },
@@ -508,6 +512,9 @@ async function editPage(id) {
     statsWrap);
   loadStats(range);
 }
+
+// Trimmed input values by key, empty ones as null.
+const vals = (inputs) => Object.fromEntries(Object.entries(inputs).map(([k, e]) => [k, e.value.trim() || null]));
 
 function healthText(hl) {
   const what = hl.code === 0 ? `No answer${hl.error ? ` (${hl.error})` : ""}` : `HTTP ${hl.code}`;

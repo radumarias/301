@@ -113,6 +113,11 @@ pub async fn fetch_with_timeout(req: worker::Request, ms: u64) -> Result<Respons
     }
 }
 
+/// First 300 characters of an error message, for storing and showing.
+pub fn snippet(s: &str) -> String {
+    s.chars().take(300).collect()
+}
+
 /// Lowercase hex of some bytes.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

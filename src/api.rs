@@ -12,13 +12,17 @@ use std::collections::{BTreeMap, HashMap};
 use wasm_bindgen::JsValue;
 use worker::{Context, Env, Method, Request, Response, Result};
 
-/// Sends a link event to webhooks after the response.
-fn fire_link(env: &Env, ctx: &Context, event: &'static str, link: &Link) {
+/// Sends a link event for some links to webhooks after the response.
+fn fire_links(env: &Env, ctx: &Context, event: &'static str, links: &[Link]) {
     let env = env.clone();
-    let data = serde_json::to_value(link).unwrap_or_default();
-    ctx.wait_until(async move { webhooks::fire(&env, event, data).await });
+    let data = links
+        .iter()
+        .map(|l| serde_json::to_value(l).unwrap_or_default())
+        .collect();
+    ctx.wait_until(async move { webhooks::fire_links(&env, event, data).await });
 }
 
+/// Responds with a stored link and, on success, fires the matching webhook event.
 fn fired(
     env: &Env,
     ctx: &Context,
@@ -27,7 +31,7 @@ fn fired(
     status: u16,
 ) -> Result<Response> {
     if let Ok(l) = &r {
-        fire_link(env, ctx, event, l);
+        fire_links(env, ctx, event, std::slice::from_ref(l));
     }
     respond(r, status)
 }
@@ -144,16 +148,13 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
                 200,
             )
         }
-        (Method::Delete, ["links", _], Some(id)) => {
-            let Some(link) = store::get_link(&env, id).await? else {
-                return json_error("not found", 404);
-            };
-            let r = store::delete_links(&env, std::slice::from_ref(&link)).await;
-            if r.is_ok() {
-                fire_link(&env, &ctx, "link.deleted", &link);
+        (Method::Delete, ["links", _], Some(id)) => match store::delete_link(&env, id).await {
+            Ok(link) => {
+                fire_links(&env, &ctx, "link.deleted", &[link]);
+                json(&ok_json(), 200)
             }
-            respond(r.map(|_| ok_json()), 200)
-        }
+            Err(e) => store_err(e),
+        },
         (Method::Post, ["links", _, "check"], Some(id)) => {
             let Some(link) = store::get_link(&env, id).await? else {
                 return json_error("not found", 404);
@@ -250,17 +251,16 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
             )
         }
 
-        (Method::Get, ["backups"], _) => match backup::enabled(&env) {
-            true => json(&backup::list(&env).await?, 200),
-            false => json_error("backups need an R2 bucket bound as BACKUPS", 503),
-        },
-        (Method::Post, ["backups"], _) => match backup::enabled(&env) {
-            true => json(&serde_json::json!({ "key": backup::run(&env).await? }), 201),
-            false => json_error("backups need an R2 bucket bound as BACKUPS", 503),
-        },
+        (_, ["backups", ..], _) if !backup::enabled(&env) => {
+            json_error("backups need an R2 bucket bound as BACKUPS", 503)
+        }
+        (Method::Get, ["backups"], _) => json(&backup::list(&env).await?, 200),
+        (Method::Post, ["backups"], _) => {
+            json(&serde_json::json!({ "key": backup::run(&env).await? }), 201)
+        }
         (Method::Get, ["backups", "download"], _) => {
             let key = q("key").unwrap_or_default();
-            if !backup::valid_key(key) || !backup::enabled(&env) {
+            if !backup::valid_key(key) {
                 return json_error("not found", 404);
             }
             let Some(obj) = env.bucket(backup::BINDING)?.get(key).execute().await? else {
@@ -432,14 +432,12 @@ async fn bulk(env: &Env, ctx: &Context, body: Bulk) -> Result<Response> {
     let links = store::with_aliases(env, links).await?;
 
     let Some(input) = input else {
-        let r = store::delete_links(env, &links).await;
-        if r.is_ok() {
-            for l in &links {
-                fire_link(env, ctx, "link.deleted", l);
-            }
+        if let Err(e) = store::delete_links(env, &links).await {
+            return store_err(e);
         }
-        return respond(
-            r.map(|_| serde_json::json!({ "done": links.len(), "errors": [] })),
+        fire_links(env, ctx, "link.deleted", &links);
+        return json(
+            &serde_json::json!({ "done": links.len(), "errors": [] }),
             200,
         );
     };
@@ -464,9 +462,7 @@ async fn bulk(env: &Env, ctx: &Context, body: Bulk) -> Result<Response> {
             return store_err(e);
         }
     }
-    for l in &updated {
-        fire_link(env, ctx, "link.updated", l);
-    }
+    fire_links(env, ctx, "link.updated", &updated);
     json(
         &serde_json::json!({ "done": updated.len(), "errors": errors }),
         200,
@@ -569,7 +565,7 @@ async fn d1_stats(env: &Env, link: Option<i64>, since: i64, bucket: i64) -> Resu
     ];
     for col in &dims {
         let (expr, extra) = if *col == "variant" {
-            ("CAST(variant AS TEXT)", " AND variant IS NOT NULL")
+            ("variant", " AND variant IS NOT NULL")
         } else {
             (*col, "")
         };
@@ -636,12 +632,10 @@ async fn ae_stats(
 ) -> Result<Agg> {
     let dims = dims_for(link);
     let sql = analytics::stats_sql(&cfg.dataset, since, bucket, link, &dims);
-    let results =
-        futures_util::future::join_all(sql.iter().map(|q| analytics::query(cfg, q))).await;
-    let mut rows = vec![];
-    for r in results {
-        rows.push(r?);
-    }
+    let rows = futures_util::future::join_all(sql.iter().map(|q| analytics::query(cfg, q)))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
     let first = rows[0].first();
     let mut agg = Agg {
         humans: analytics::num(first.and_then(|r| r.get("humans"))),
@@ -685,19 +679,25 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
     let (since, bucket) = range(r);
     // D1 holds clicks from before Analytics Engine was switched on (and all clicks when it
     // is off); both are added up.
-    let mut agg = d1_stats(env, link, since, bucket).await?;
-    let mut analytics_error = None;
-    if let Some(cfg) = analytics::config(env) {
-        match ae_stats(&cfg, link, since, bucket).await {
-            Ok(a) => agg.merge(a),
-            Err(e) => {
-                worker::console_error!("analytics engine stats failed: {e}");
-                analytics_error = Some(
-                    "Analytics Engine could not be queried; showing database clicks only"
-                        .to_string(),
-                );
-            }
+    let cfg = analytics::config(env);
+    let ae = async {
+        match &cfg {
+            Some(c) => Some(ae_stats(c, link, since, bucket).await),
+            None => None,
         }
+    };
+    let (d1, ae) = futures_util::future::join(d1_stats(env, link, since, bucket), ae).await;
+    let mut agg = d1?;
+    let mut analytics_error = None;
+    match ae {
+        Some(Ok(a)) => agg.merge(a),
+        Some(Err(e)) => {
+            worker::console_error!("analytics engine stats failed: {e}");
+            analytics_error = Some(
+                "Analytics Engine could not be queried; showing database clicks only".to_string(),
+            );
+        }
+        None => {}
     }
 
     let mut dims = serde_json::Map::new();
@@ -719,7 +719,7 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
         "qr": agg.qr,
         "series": series,
         "top": dims,
-        "analytics_engine": analytics::enabled(env),
+        "analytics_engine": cfg.is_some(),
         "analytics_error": analytics_error,
     });
     if link.is_none() {

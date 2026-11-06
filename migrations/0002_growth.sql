@@ -13,8 +13,9 @@ ALTER TABLE links ADD COLUMN health_error TEXT;
 ALTER TABLE links ADD COLUMN health_checked_at INTEGER;
 CREATE INDEX IF NOT EXISTS links_health ON links(health_checked_at);
 
--- Which A/B variant a click went to (0 = main URL), NULL when the link has no split.
-ALTER TABLE clicks ADD COLUMN variant INTEGER;
+-- Destination an A/B split sent the click to (stable across edits of the split),
+-- NULL when the link has no split.
+ALTER TABLE clicks ADD COLUMN variant TEXT;
 
 CREATE TABLE IF NOT EXISTS webhooks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

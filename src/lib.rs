@@ -69,10 +69,12 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
         return;
     }
-    if let Err(e) = analytics::rollup(&env).await {
+    let (rollup, checks) =
+        futures_util::future::join(analytics::rollup(&env), health::run_batch(&env)).await;
+    if let Err(e) = rollup {
         worker::console_error!("analytics rollup failed: {e}");
     }
-    match health::run_batch(&env).await {
+    match checks {
         Ok(n) if n > 0 => worker::console_log!("checked {n} destinations"),
         Ok(_) => {}
         Err(e) => worker::console_error!("link check failed: {e}"),

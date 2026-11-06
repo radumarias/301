@@ -495,9 +495,11 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
     forget_kv(env, &slugs).await
 }
 
-pub async fn delete_link(env: &Env, id: i64) -> SResult<()> {
+/// Deletes one link and returns it (for webhooks).
+pub async fn delete_link(env: &Env, id: i64) -> SResult<Link> {
     let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    delete_links(env, &[link]).await
+    delete_links(env, std::slice::from_ref(&link)).await?;
+    Ok(link)
 }
 
 pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {
@@ -612,27 +614,32 @@ pub async fn resync(env: &Env, id: i64) -> SResult<()> {
     }
 }
 
-pub struct Click<'a> {
+#[derive(Serialize)]
+pub struct Click {
+    #[serde(skip)]
     pub link_id: i64,
-    pub slug: &'a str,
+    #[serde(skip)]
+    pub slug: String,
     pub ts: i64,
     pub country: Option<String>,
     pub city: Option<String>,
     pub referrer: Option<String>,
-    pub device: &'a str,
-    pub os: &'a str,
-    pub browser: &'a str,
+    pub device: &'static str,
+    pub os: &'static str,
+    pub browser: &'static str,
+    #[serde(skip)]
     pub bot: bool,
     pub qr: bool,
-    /// A/B variant served (0 = main URL), when the link has a split.
-    pub variant: Option<u8>,
+    /// Destination the A/B split picked, when the link has a split.
+    pub variant: Option<String>,
     /// Already added to `links.clicks` by `consume_click`.
+    #[serde(skip)]
     pub counted: bool,
 }
 
 /// Logs a click: to Analytics Engine when it is configured (no D1 writes; a cron job
 /// rolls the counts into `links.clicks`), otherwise to the D1 `clicks` table.
-pub async fn record_click(env: &Env, c: &Click<'_>) -> worker::Result<()> {
+pub async fn record_click(env: &Env, c: &Click) -> worker::Result<()> {
     if crate::analytics::enabled(env) {
         return crate::analytics::write(env, c);
     }
@@ -650,7 +657,7 @@ pub async fn record_click(env: &Env, c: &Click<'_>) -> worker::Result<()> {
             s(c.browser),
             b(c.bot),
             b(c.qr),
-            on(c.variant.map(i64::from)),
+            os(&c.variant),
         ])?];
     if !c.bot && !c.counted {
         stmts.push(

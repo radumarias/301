@@ -660,15 +660,15 @@ impl KvRecord {
     }
 
     /// Picks the destination: device rule, then geo rule, then the A/B split (or the
-    /// default). `roll` is a random number in 0..100; the second value is the variant
-    /// served (0 = main URL), `None` when the link has no split or a rule matched.
+    /// default). `roll` gives a random number in 0..100 and is only called for a split.
+    /// The bool says the destination came from the A/B split.
     pub fn destination(
         &self,
         os: &str,
         device: &str,
         country: Option<&str>,
-        roll: u8,
-    ) -> (&str, Option<u8>) {
+        roll: impl FnOnce() -> u8,
+    ) -> (&str, bool) {
         let by_device = match os {
             "iOS" => self.device.ios.as_deref(),
             "Android" => self.device.android.as_deref(),
@@ -678,36 +678,30 @@ impl KvRecord {
         if let Some(u) =
             by_device.or_else(|| country.and_then(|c| self.geo.get(c)).map(String::as_str))
         {
-            return (u, None);
+            return (u, false);
         }
         if self.variants.is_empty() {
-            return (&self.url, None);
+            return (&self.url, false);
         }
-        (
-            pick_variant(&self.url, &self.variants, roll),
-            Some(variant_index(&self.variants, roll)),
-        )
+        let url = match variant_index(&self.variants, roll()) {
+            0 => &self.url,
+            i => &self.variants[i - 1].url,
+        };
+        (url, true)
     }
 }
 
 /// Index of the variant `roll` (0..100) lands on: variants take the first slices of the
 /// range, the main URL (index 0) the rest.
-pub fn variant_index(variants: &[Variant], roll: u8) -> u8 {
+pub fn variant_index(variants: &[Variant], roll: u8) -> usize {
     let mut acc = 0u32;
     for (i, v) in variants.iter().enumerate() {
         acc += v.weight as u32;
         if (roll as u32) < acc {
-            return (i + 1) as u8;
+            return i + 1;
         }
     }
     0
-}
-
-fn pick_variant<'a>(main: &'a str, variants: &'a [Variant], roll: u8) -> &'a str {
-    match variant_index(variants, roll) {
-        0 => main,
-        i => &variants[i as usize - 1].url,
-    }
 }
 
 #[cfg(test)]
@@ -774,20 +768,20 @@ mod tests {
             passthrough: false,
         };
         assert_eq!(
-            r.destination("iOS", "mobile", Some("RO"), 0).0,
+            r.destination("iOS", "mobile", Some("RO"), || 0).0,
             "https://ios"
         );
         assert_eq!(
-            r.destination("Android", "mobile", Some("RO"), 0).0,
+            r.destination("Android", "mobile", Some("RO"), || 0).0,
             "https://ro"
         );
         assert_eq!(
-            r.destination("Windows", "desktop", Some("US"), 0),
-            ("https://default", None)
+            r.destination("Windows", "desktop", Some("US"), || 0),
+            ("https://default", false)
         );
         r.device.desktop = Some("https://desk".into());
         assert_eq!(
-            r.destination("Windows", "desktop", Some("RO"), 0).0,
+            r.destination("Windows", "desktop", Some("RO"), || 0).0,
             "https://desk"
         );
         // A/B split only applies when no rule matched.
@@ -796,17 +790,17 @@ mod tests {
             weight: 30,
         }];
         assert_eq!(
-            r.destination("Windows", "desktop", None, 10),
-            ("https://desk", None)
+            r.destination("Windows", "desktop", None, || 10),
+            ("https://desk", false)
         );
         r.device.desktop = None;
         assert_eq!(
-            r.destination("Linux", "desktop", None, 10),
-            ("https://b", Some(1))
+            r.destination("Linux", "desktop", None, || 10),
+            ("https://b", true)
         );
         assert_eq!(
-            r.destination("Linux", "desktop", None, 30),
-            ("https://default", Some(0))
+            r.destination("Linux", "desktop", None, || 30),
+            ("https://default", true)
         );
     }
 

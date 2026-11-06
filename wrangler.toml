@@ -1,9 +1,9 @@
 name = "xorio-301"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
-# Served on <name>.<account subdomain>.workers.dev. To move to a custom domain, set
-# workers_dev = false, add routes = [{ pattern = "301.xorio.rs", custom_domain = true }]
-# and the DOMAIN repo variable.
+# Served on <name>.<account subdomain>.workers.dev. To move to a custom domain, set the
+# DOMAIN repo variable (e.g. 301.xorio.rs): scripts/provision.sh then sets
+# workers_dev = false and adds the custom_domain route in CI.
 workers_dev = true
 
 [build]

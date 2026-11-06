@@ -8,14 +8,13 @@
 //!
 //! Data point layout (keep in sync with the SQL below):
 //!   index1  link id
-//!   blob1..blob7  country, city, referrer, device, os, browser, slug
-//!   double1 bot (0/1), double2 qr (0/1), double3 already counted in D1 (0/1),
-//!   double4 A/B variant (-1 = no split)
+//!   blob1..blob8  country, city, referrer, device, os, browser, slug,
+//!                 A/B destination ('' = no split)
+//!   double1 bot (0/1), double2 qr (0/1), double3 already counted in D1 (0/1)
 
 use crate::store::{self, Click};
 use crate::util::{self, now_ms};
 use serde_json::Value;
-use std::collections::HashMap;
 use worker::{AnalyticsEngineDataPointBuilder, Env, Headers, Method, Request, RequestInit};
 
 pub const BINDING: &str = "CLICKS_AE";
@@ -62,7 +61,7 @@ pub fn enabled(env: &Env) -> bool {
     config(env).is_some()
 }
 
-pub fn write(env: &Env, c: &Click<'_>) -> worker::Result<()> {
+pub fn write(env: &Env, c: &Click) -> worker::Result<()> {
     let ds = env.analytics_engine(BINDING)?;
     let id = c.link_id.to_string();
     let opt = |v: &Option<String>| v.clone().unwrap_or_default();
@@ -75,13 +74,13 @@ pub fn write(env: &Env, c: &Click<'_>) -> worker::Result<()> {
             c.device.to_string(),
             c.os.to_string(),
             c.browser.to_string(),
-            c.slug.to_string(),
+            c.slug.clone(),
+            opt(&c.variant),
         ])
         .doubles([
             c.bot as u8 as f64,
             c.qr as u8 as f64,
             c.counted as u8 as f64,
-            c.variant.map(f64::from).unwrap_or(-1.0),
         ])
         .write_to(&ds)
 }
@@ -106,7 +105,7 @@ pub async fn query(cfg: &Config, sql: &str) -> worker::Result<Vec<Value>> {
         return Err(worker::Error::RustError(format!(
             "analytics engine query failed ({}): {}",
             res.status_code(),
-            text.chars().take(300).collect::<String>()
+            util::snippet(&text)
         )));
     }
     let v: Value = serde_json::from_str(&text)?;
@@ -140,7 +139,7 @@ pub fn dim_column(dim: &str) -> Option<&'static str> {
         "device" => "blob4",
         "os" => "blob5",
         "browser" => "blob6",
-        "variant" => "toString(toInt32(double4))",
+        "variant" => "blob8",
         _ => return None,
     })
 }
@@ -171,7 +170,7 @@ pub fn stats_sql(
     for d in dims {
         let col = dim_column(d).unwrap_or("blob1");
         let extra = if *d == "variant" {
-            " AND double4 >= 0"
+            " AND blob8 != ''"
         } else {
             ""
         };
@@ -212,19 +211,16 @@ pub async fn rollup(env: &Env) -> worker::Result<usize> {
     .await?;
     let d = store::db(env)?;
     let mut stmts = vec![];
-    let mut per_link: HashMap<i64, (i64, i64)> = HashMap::new();
     for r in &rows {
         let Some(id) = text(r.get("id")).and_then(|s| s.parse::<i64>().ok()) else {
             continue;
         };
-        per_link.insert(id, (num(r.get("n")), num(r.get("last")) * 1000));
-    }
-    for (id, (n, last)) in &per_link {
         stmts.push(
             d.prepare("UPDATE links SET clicks = clicks + ?2, last_click_at = MAX(COALESCE(last_click_at, 0), ?3) WHERE id = ?1")
-                .bind(&[store::n(*id), store::n(*n), store::n(*last)])?,
+                .bind(&[store::n(id), store::n(num(r.get("n"))), store::n(num(r.get("last")) * 1000)])?,
         );
     }
+    let updated = stmts.len();
     // Counts and the cursor move together, so a failed run is simply retried.
     stmts.push(store::set_state_stmt(
         &d,
@@ -232,7 +228,7 @@ pub async fn rollup(env: &Env) -> worker::Result<usize> {
         &until.to_string(),
     )?);
     d.batch(stmts).await?;
-    Ok(per_link.len())
+    Ok(updated)
 }
 
 #[cfg(test)]
@@ -265,7 +261,7 @@ mod tests {
         assert_eq!(q.len(), 4);
         assert!(q[0].contains("index1 = '7'") && q[0].contains("toDateTime(86400)"));
         assert!(q[1].contains("intDiv(toUInt32(timestamp), 3600) * 3600"));
-        assert!(q[3].contains("double4 >= 0"));
+        assert!(q[3].contains("blob8 != ''"));
         assert_eq!(stats_sql("ds", 0, 86_400_000, None, &[]).len(), 3);
     }
 }

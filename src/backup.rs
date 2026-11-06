@@ -58,17 +58,21 @@ pub struct BackupInfo {
 pub async fn run(env: &Env) -> worker::Result<String> {
     let bucket = env.bucket(BINDING)?;
     let now = now_ms();
-    if env.d1("DB").is_err() {
-        return Err(worker::Error::RustError("no database".into()));
-    }
+    let (links, aliases, settings, webhooks) = futures_util::future::try_join4(
+        dump(env, "links", "id"),
+        dump(env, "aliases", "slug"),
+        dump(env, "settings", "key"),
+        dump(env, "webhooks", "id"),
+    )
+    .await?;
     let body = serde_json::json!({
         "format": "xorio-301-backup",
         "version": 1,
         "created_at": iso(now),
-        "links": dump(env, "links", "id").await?,
-        "aliases": dump(env, "aliases", "slug").await?,
-        "settings": dump(env, "settings", "key").await?,
-        "webhooks": dump(env, "webhooks", "id").await?,
+        "links": links,
+        "aliases": aliases,
+        "settings": settings,
+        "webhooks": webhooks,
     });
     let key = format!("{PREFIX}{}.json", &iso(now)[..10]);
     bucket
@@ -119,10 +123,11 @@ pub async fn prune(env: &Env, keep_days: u32) -> worker::Result<usize> {
         .filter(|b| b.uploaded < cutoff)
         .map(|b| b.key)
         .collect();
-    if !old.is_empty() {
-        env.bucket(BINDING)?.delete_multiple(old.clone()).await?;
+    let count = old.len();
+    if count > 0 {
+        env.bucket(BINDING)?.delete_multiple(old).await?;
     }
-    Ok(old.len())
+    Ok(count)
 }
 
 /// Only keys this module writes may be downloaded.

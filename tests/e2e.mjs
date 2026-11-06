@@ -103,7 +103,7 @@ test("A/B split sends traffic to variants and records them", async () => {
   assert.ok(seen.has("https://example.com/b"), [...seen].join());
   await eventually(async () => {
     const st = await api("GET", `/links/${data.id}/stats?range=24h`);
-    return (st.data.top.variant || []).some((r) => r.k === "1" && r.n > 0);
+    return (st.data.top.variant || []).some((r) => r.k === "https://example.com/b" && r.n > 0);
   }, "variant stats");
   const bad = await api("POST", "/links", { url: "https://example.com/a", variants: [{ url: "https://example.com/b", weight: 100 }] });
   assert.equal(bad.status, 400);
