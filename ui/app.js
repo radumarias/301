@@ -83,7 +83,11 @@ const fromLocalInput = (v) => (v ? new Date(v).getTime() : null);
 const routes = [
   [/^#?\/?$/, dashboard, "dash"],
   [/^#\/links\/?$/, linksPage, "links"],
-  [/^#\/links\/new$/, (m) => editPage(null), "links"],
+  [/^#\/links\/new(?:\?(.*))?$/, (m) => {
+    const u = new URLSearchParams(m[1] || "").get("url");
+    if (u) sessionStorage.setItem("prefill-url", u);
+    return editPage(null);
+  }, "links"],
   [/^#\/links\/(\d+)$/, (m) => editPage(Number(m[1])), "links"],
   [/^#\/import$/, importPage, "import"],
   [/^#\/settings$/, settingsPage, "settings"],
@@ -161,9 +165,12 @@ function rangePicker(current, onPick) {
   return h("div", { class: "seg" }, ["24h", "7d", "30d", "90d", "all"].map((r) =>
     h("button", { class: r === current ? "on" : "", onclick: () => onPick(r) }, r)));
 }
-function statsBlock(st) {
+function statsBlock(st, L) {
   const t = st.top || {};
+  const variantName = (k) => { const i = Number(k); return `${String.fromCharCode(65 + i)} · ${i === 0 ? L.url : (L.variants[i - 1] || {}).url || "removed variant"}`; };
   return [
+    st.analytics_error && h("div", { class: "panel" }, h("p", { class: "bad small", style: "margin:0" }, st.analytics_error)),
+    L && L.variants && L.variants.length > 0 && bars("A/B variants", (t.variant || []).map((r) => ({ k: variantName(r.k), n: r.n }))),
     h("div", { class: "panel" }, lineChart(st.series || [], st.bucket_ms, st.since)),
     h("div", { class: "grid g3" },
       bars("Countries", t.country || []), bars("Referrers", t.referrer || []), bars("Devices", t.device || []),
@@ -176,13 +183,15 @@ async function dashboard() {
   const range = sessionStorage.getItem("range") || "30d";
   const st = await api("GET", `/stats?range=${range}`);
   const pick = (r) => { sessionStorage.setItem("range", r); render(); };
-  const [chart, dims] = statsBlock(st);
+  const [note, , chart, dims] = statsBlock(st);
   $app.replaceChildren(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Dashboard"), h("div", { class: "muted" }, "Human clicks; bots and link previews are counted separately.")), rangePicker(range, pick)),
     h("div", { class: "grid g4", style: "margin-bottom:16px" },
       stat("Clicks", st.clicks), stat("Links", st.links), stat("QR scans", st.qr), stat("Bot hits", st.bots)),
+    st.broken > 0 && h("a", { class: "panel notice", href: "#/links", onclick: () => { listState.status = "broken"; listState.offset = 0; } },
+      h("b", {}, `${fmt.n(st.broken)} link${st.broken === 1 ? "" : "s"} point to a broken page`), h("span", { class: "muted" }, " · the daily check got a 404, 410, 5xx or no answer. Show them →")),
     h("div", { class: "grid", style: "gap:16px" },
-      chart,
+      note, chart,
       h("div", { class: "panel" }, h("h2", {}, "Top links"),
         (st.top_links || []).length ? h("table", {}, h("tbody", {}, st.top_links.map((l) =>
           h("tr", { class: "link-row", onclick: () => (location.hash = `#/links/${l.id}`) },
@@ -205,7 +214,7 @@ async function linksPage() {
   const tagSel = h("select", { onchange: setFilter("tag") },
     h("option", { value: "" }, "All tags"), tags.map((t) => h("option", { value: t.tag, selected: t.tag === listState.tag }, `${t.tag} (${t.n})`)));
   const statusSel = h("select", { onchange: setFilter("status") },
-    [["", "Any status"], ["active", "Active"], ["disabled", "Disabled"], ["expired", "Expired"], ["protected", "Password"]].map(([v, l]) => h("option", { value: v, selected: v === listState.status }, l)));
+    [["", "Any status"], ["active", "Active"], ["disabled", "Disabled"], ["expired", "Expired"], ["protected", "Password"], ["broken", "Broken destination"]].map(([v, l]) => h("option", { value: v, selected: v === listState.status }, l)));
   const sortSel = h("select", { onchange: (e) => { const [s1, o] = e.target.value.split(":"); listState.sort = s1; listState.order = o; linksPage(); } },
     [["created:desc", "Newest"], ["created:asc", "Oldest"], ["clicks:desc", "Most clicks"], ["last_click:desc", "Recently clicked"], ["slug:asc", "Slug A→Z"]].map(([v, l]) =>
       h("option", { value: v, selected: v === `${listState.sort}:${listState.order}` }, l)));
@@ -242,7 +251,9 @@ async function linksPage() {
         h("div", {}, h("span", { class: "slug" }, "/" + l.slug),
           l.status === "disabled" && h("span", { class: "badge off" }, "OFF"),
           l.has_password && h("span", { class: "badge lock" }, "PW"),
-          l.status === "expired" && h("span", { class: "badge exp" }, "EXPIRED")),
+          l.status === "expired" && h("span", { class: "badge exp" }, "EXPIRED"),
+          l.health && l.health.broken && h("span", { class: "badge bad", title: healthText(l.health) }, "BROKEN"),
+          l.variants.length > 0 && h("span", { class: "badge lock" }, "A/B")),
         h("div", { class: "dest" }, l.title ? `${l.title} · ${l.url}` : l.url),
         h("div", {}, l.tags.map((t) => h("span", { class: "tag" }, t)))),
       h("td", { class: "num" }, fmt.n(l.clicks), h("div", { class: "muted small" }, fmt.ago(l.last_click_at))),
@@ -284,7 +295,7 @@ function applyUtm(url, utm) {
 async function editPage(id) {
   const [link, settings] = await Promise.all([id ? api("GET", `/links/${id}`) : null, api("GET", "/settings")]);
   const isNew = !link;
-  const L = link || { url: sessionStorage.getItem("prefill-url") || "", slug: "", tags: [], redirect_type: settings.default_redirect, passthrough: true, utm: {}, geo: {}, device: {}, aliases: [] };
+  const L = link || { url: sessionStorage.getItem("prefill-url") || "", slug: "", tags: [], redirect_type: settings.default_redirect, passthrough: true, utm: {}, geo: {}, device: {}, og: {}, variants: [], app: {}, aliases: [] };
   sessionStorage.removeItem("prefill-url");
 
   const f = {};
@@ -339,6 +350,46 @@ async function editPage(id) {
   const dev = {};
   for (const k of ["ios", "android", "desktop"]) dev[k] = h("input", { type: "url", value: (L.device || {})[k] || "", placeholder: { ios: "https://apps.apple.com/app/…", android: "https://play.google.com/store/apps/details?id=…", desktop: "https://example.com/desktop" }[k] });
 
+  const og = {
+    title: h("input", { type: "text", maxlength: 300, value: (L.og || {}).title || "", placeholder: "Headline shown in Slack, X, iMessage, WhatsApp…" }),
+    description: h("textarea", { maxlength: 1000, placeholder: "One or two sentences" }, (L.og || {}).description || ""),
+    image: h("input", { type: "url", value: (L.og || {}).image || "", placeholder: "https://example.com/card-1200x630.png" }),
+  };
+  const card = h("div", { class: "og-card" });
+  const updCard = () => {
+    const img = og.image.value.trim();
+    card.replaceChildren(
+      img ? h("img", { src: img, alt: "", referrerpolicy: "no-referrer", onerror: (e) => e.target.remove() }) : h("div", { class: "og-noimg muted small" }, "No image"),
+      h("div", { class: "og-body" }, h("div", { class: "muted small" }, ORIGIN.replace(/^https?:\/\//, "")),
+        h("b", {}, og.title.value.trim() || "Title"), h("div", { class: "small muted" }, og.description.value.trim() || "Description")));
+  };
+  Object.values(og).forEach((e) => e.addEventListener("input", updCard));
+  updCard();
+
+  const varBox = h("div");
+  const mainShare = h("div", { class: "hint" });
+  const updShare = () => {
+    const used = [...varBox.querySelectorAll(".var-w")].reduce((a, e) => a + (Number(e.value) || 0), 0);
+    const rows = varBox.querySelectorAll(".rule").length;
+    mainShare.textContent = rows ? `A (main URL) gets ${Math.max(0, 100 - used)}% of visitors.` : "Add a variant to split traffic between destinations.";
+    mainShare.className = used > 99 ? "hint bad" : "hint";
+  };
+  const addVariant = (url = "", weight = 50) => {
+    if (varBox.querySelectorAll(".rule").length >= 4) return toast("At most 4 variants", true);
+    const row = h("div", { class: "rule var" },
+      h("span", { class: "muted small var-l" }),
+      h("input", { type: "url", placeholder: "https://example.com/variant", value: url, class: "var-url" }),
+      h("input", { type: "number", min: 1, max: 99, value: weight, class: "var-w", title: "Share of visitors in %", oninput: updShare }),
+      h("button", { class: "btn sm", type: "button", onclick: () => { row.remove(); relabel(); } }, "✕"));
+    varBox.append(row); relabel();
+  };
+  const relabel = () => { varBox.querySelectorAll(".var-l").forEach((e, i) => (e.textContent = String.fromCharCode(66 + i))); updShare(); };
+  (L.variants || []).forEach((v) => addVariant(v.url, v.weight));
+  updShare();
+
+  const app = {};
+  for (const k of ["ios", "android"]) app[k] = h("input", { type: "text", value: (L.app || {})[k] || "", spellcheck: "false", placeholder: { ios: "myapp://item/42", android: "intent://item/42#Intent;scheme=myapp;package=com.example;end" }[k] });
+
   const hasAdvanced = (o) => Object.values(o || {}).some(Boolean);
   const form = h("form", { class: "panel", onsubmit: save },
     field("Destination URL", f.url),
@@ -359,6 +410,15 @@ async function editPage(id) {
       h("label", {}, "Country rules"), h("div", { class: "hint", style: "margin:-2px 0 8px" }, "ISO country code from Cloudflare (e.g. US, RO, DE). Device rules win over country rules."),
       geoBox, h("button", { class: "btn sm", type: "button", onclick: () => addGeo() }, "+ Add country"),
       h("div", { class: "grid g3", style: "margin-top:14px" }, field("iOS", dev.ios), field("Android", dev.android), field("Desktop", dev.desktop))),
+    h("details", { class: "section", open: hasAdvanced(L.og) || undefined }, h("summary", {}, "Social preview"),
+      h("div", { class: "hint", style: "margin:-2px 0 10px" }, "What chat apps and social networks show when the short link is shared. People still go straight to the destination."),
+      h("div", { class: "grid g2" }, h("div", {}, field("Title", og.title), field("Description", og.description), field("Image URL", og.image, "1200×630 works everywhere")), h("div", {}, h("label", {}, "Preview"), card))),
+    h("details", { class: "section", open: (L.variants || []).length > 0 || undefined }, h("summary", {}, "A/B split"),
+      h("div", { class: "hint", style: "margin:-2px 0 8px" }, "Send a share of visitors (in %) to other destinations. Device and country rules still win. Clicks are counted per variant."),
+      varBox, mainShare, h("button", { class: "btn sm", type: "button", style: "margin-top:8px", onclick: () => addVariant() }, "+ Add variant")),
+    h("details", { class: "section", open: hasAdvanced(L.app) || undefined }, h("summary", {}, "Open in app"),
+      h("div", { class: "hint", style: "margin:-2px 0 8px" }, "On phones, try the app first; if it is not installed the visitor continues to the web destination (or the iOS/Android rule above) after a moment."),
+      h("div", { class: "grid g2" }, field("iOS app link", app.ios), field("Android app link", app.android))),
     h("details", { class: "section" }, h("summary", {}, "Redirect behaviour"),
       field("Redirect type", f.type),
       h("label", { class: "check" }, f.passthrough, "Pass the visitor's query string through to the destination")),
@@ -388,6 +448,9 @@ async function editPage(id) {
       utm: Object.fromEntries(Object.entries(utm).map(([k, e]) => [k, e.value.trim() || null])),
       geo,
       device: Object.fromEntries(Object.entries(dev).map(([k, e]) => [k, e.value.trim() || null])),
+      og: Object.fromEntries(Object.entries(og).map(([k, e]) => [k, e.value.trim() || null])),
+      variants: [...varBox.querySelectorAll(".rule")].map((r) => ({ url: r.querySelector(".var-url").value.trim(), weight: Number(r.querySelector(".var-w").value) || 0 })).filter((v) => v.url),
+      app: Object.fromEntries(Object.entries(app).map(([k, e]) => [k, e.value.trim() || null])),
     };
     const slugV = f.slug.value.trim();
     if (slugV) body.slug = slugV; else if (isNew) body.slug_style = styleSel.value;
@@ -418,6 +481,15 @@ async function editPage(id) {
       h("span", { class: "slug small" }, "/" + a),
       h("button", { class: "btn sm", onclick: async () => { await api("DELETE", `/links/${L.id}/aliases/${a.split("/").map(encodeURIComponent).join("/")}`); toast("Alias removed"); editPage(L.id); } }, "Remove")))
       : h("p", { class: "muted small" }, "Renaming the slug keeps the old one working as an alias."));
+  const healthLine = h("p", { class: "small" }, L.health ? healthText(L.health) : "Not checked yet. Destinations are checked about once a day.");
+  if (L.health && L.health.broken) healthLine.classList.add("bad");
+  const healthPanel = h("div", { class: "panel" }, h("h2", {}, "Destination health"), healthLine,
+    h("button", { class: "btn sm", onclick: async (e) => {
+      e.target.disabled = true;
+      try { const r = await api("POST", `/links/${L.id}/check`); healthLine.textContent = healthText(r); healthLine.className = "small" + (r.broken ? " bad" : " ok"); }
+      catch (err) { toast(err.message, true); }
+      e.target.disabled = false;
+    } }, "Check now"));
   const statsWrap = h("div", { class: "grid", style: "gap:16px; margin-top:16px" });
   const range = sessionStorage.getItem("range") || "30d";
   async function loadStats(r) {
@@ -426,15 +498,20 @@ async function editPage(id) {
     statsWrap.replaceChildren(
       h("div", { class: "page-head", style: "margin:8px 0 0" }, h("h2", { style: "margin:0" }, "Analytics"), rangePicker(r, loadStats)),
       h("div", { class: "grid g4" }, stat("Clicks", st.clicks), stat("QR scans", st.qr), stat("Bot hits", st.bots), stat("All-time clicks", L.clicks)),
-      ...statsBlock(st));
+      ...statsBlock(st, L).filter(Boolean));
   }
   $app.replaceChildren(
     h("div", { class: "page-head" },
       h("div", {}, h("div", { class: "shorturl" }, shortUrl(L.slug)), h("div", { class: "muted small" }, `Created ${fmt.dt(L.created_at)} · source: ${L.source} · last click ${fmt.ago(L.last_click_at)}`)),
       h("div", { class: "row" }, h("button", { class: "btn primary", onclick: () => copy(shortUrl(L.slug)) }, "Copy"), h("a", { class: "btn", href: shortUrl(L.slug) + "+", target: "_blank", rel: "noopener" }, "Preview"))),
-    h("div", { class: "grid side" }, form, h("div", { class: "grid" }, qr, aliasPanel)),
+    h("div", { class: "grid side" }, form, h("div", { class: "grid" }, qr, healthPanel, aliasPanel)),
     statsWrap);
   loadStats(range);
+}
+
+function healthText(hl) {
+  const what = hl.code === 0 ? `No answer${hl.error ? ` (${hl.error})` : ""}` : `HTTP ${hl.code}`;
+  return `${hl.broken ? "Broken" : "OK"}: ${what}, checked ${fmt.ago(hl.checked_at)}.`;
 }
 
 function qrPanel(L) {
@@ -654,18 +731,20 @@ async function importPage() {
 
 // ---------- settings ----------
 async function settingsPage() {
-  const st = await api("GET", "/settings");
+  const [st, status] = await Promise.all([api("GET", "/settings"), api("GET", "/status")]);
   const root = h("input", { type: "url", value: st.root_url || "", placeholder: "Empty: a small landing page" });
   const nf = h("input", { type: "url", value: st.not_found_url || "", placeholder: "Empty: a 404 page" });
   const red = h("select", {}, [301, 302, 307, 308].map((v) => h("option", { value: v, selected: v === st.default_redirect }, v)));
   const style = h("select", {}, [["random", "Random chars (k7RmQ2x)"], ["words", "Words (brave-otter-42)"], ["names", "Names (curious-lovelace)"]].map(([v, l]) => h("option", { value: v, selected: v === st.default_slug_style }, l)));
   const len = h("input", { type: "number", min: 4, max: 32, value: st.default_slug_length });
+  const retention = h("input", { type: "number", min: 0, value: st.click_retention_days ?? 0 });
+  const keep = h("input", { type: "number", min: 1, max: 3650, value: st.backup_keep_days ?? 30 });
   const theme = h("select", {}, [["", "System"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => h("option", { value: v, selected: v === (localStorage.getItem("theme") || "") }, l)));
   theme.addEventListener("change", () => { try { localStorage.setItem("theme", theme.value); } catch {} applyTheme(); });
   async function save(e) {
     e.preventDefault();
     try {
-      await api("PUT", "/settings", { root_url: root.value.trim() || null, not_found_url: nf.value.trim() || null, default_redirect: Number(red.value), default_slug_style: style.value, default_slug_length: Number(len.value) });
+      await api("PUT", "/settings", { root_url: root.value.trim() || null, not_found_url: nf.value.trim() || null, default_redirect: Number(red.value), default_slug_style: style.value, default_slug_length: Number(len.value), click_retention_days: Number(retention.value) || 0, backup_keep_days: Number(keep.value) || 30 });
       toast("Settings saved");
     } catch (err) { toast(err.message, true); }
   }
@@ -683,20 +762,193 @@ async function settingsPage() {
     btn.disabled = false; btn.textContent = "Rebuild KV cache";
   }
   const rebuildBtn = h("button", { class: "btn", onclick: (e) => rebuild(e.target) }, "Rebuild KV cache");
+
+  // Backups
+  const backupList = h("div");
+  async function loadBackups() {
+    if (!status.backups) return;
+    try {
+      const list = await api("GET", "/backups");
+      backupList.replaceChildren(list.length ? h("table", {}, h("tbody", {}, list.slice(0, 10).map((b) => h("tr", {},
+        h("td", { class: "mono small" }, b.key.replace("daily/", "")),
+        h("td", { class: "small muted num" }, `${(b.size / 1024).toFixed(1)} KB`),
+        h("td", { class: "num" }, h("a", { class: "btn sm", href: `/api/backups/download?key=${encodeURIComponent(b.key)}` }, "Download")))))) : h("p", { class: "muted small" }, "No backups yet."));
+    } catch (e) { backupList.replaceChildren(h("p", { class: "bad small" }, e.message)); }
+  }
+  const backupPanel = h("div", { class: "panel" }, h("h2", {}, "Backups"),
+    status.backups
+      ? [h("p", { class: "muted small" }, `Every night all links, aliases, settings and webhooks go to R2. Last backup: ${status.last_backup ? fmt.dt(status.last_backup.at) : "never"}.`),
+         h("button", { class: "btn", onclick: async (e) => { e.target.disabled = true; try { const r = await api("POST", "/backups"); toast("Backed up to " + r.key); loadBackups(); } catch (err) { toast(err.message, true); } e.target.disabled = false; } }, "Back up now"),
+         h("div", { style: "margin-top:10px" }, backupList)]
+      : h("p", { class: "muted small" }, "Off: enable R2 on the Cloudflare account and give the deploy token R2 Edit, then redeploy. D1 Time Travel still lets you restore the database to any minute of the last 30 days."));
+
+  // Webhooks
+  const hookList = h("div");
+  const hookUrl = h("input", { type: "url", placeholder: "https://example.com/hooks/301" });
+  const evBoxes = (status.webhook_events || []).map((ev) => [ev, h("input", { type: "checkbox", checked: ev !== "click" })]);
+  async function loadHooks() {
+    const hooks = await api("GET", "/webhooks");
+    hookList.replaceChildren(...(hooks.length ? hooks.map((wh) => h("div", { class: "hook" },
+      h("div", { class: "row", style: "justify-content:space-between" }, h("span", { class: "mono small", style: "word-break:break-all" }, wh.url),
+        h("div", { class: "row" },
+          h("button", { class: "btn sm", onclick: async () => { const r = await api("POST", `/webhooks/${wh.id}/test`); toast(r.error ? `Test failed: ${r.error}` : `Test delivered (HTTP ${r.status})`, !!r.error); } }, "Test"),
+          h("button", { class: "btn sm danger", onclick: async () => { if (!confirm("Delete this webhook?")) return; await api("DELETE", `/webhooks/${wh.id}`); loadHooks(); } }, "Delete"))),
+      h("div", {}, wh.events.map((e) => h("span", { class: "tag" }, e))),
+      h("div", { class: "small muted" }, "Secret: ", h("code", { class: "mono" }, wh.secret)),
+      wh.last_at && h("div", { class: wh.last_error ? "small bad" : "small muted" }, `Last delivery ${fmt.ago(wh.last_at)}: ${wh.last_error || "HTTP " + wh.last_status}`)))
+      : [h("p", { class: "muted small" }, "No webhooks yet.")]));
+  }
+  const hookPanel = h("div", { class: "panel" }, h("h2", {}, "Webhooks"),
+    h("p", { class: "muted small" }, "JSON POSTs signed with X-301-Signature: sha256=HMAC(secret, body). Click events cover human clicks only."),
+    hookList,
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault();
+      try { await api("POST", "/webhooks", { url: hookUrl.value.trim(), events: evBoxes.filter(([, b]) => b.checked).map(([ev]) => ev) }); hookUrl.value = ""; loadHooks(); toast("Webhook added"); }
+      catch (err) { toast(err.message, true); }
+    } }, field("New webhook URL", hookUrl), h("div", { class: "row", style: "flex-wrap:wrap" }, evBoxes.map(([ev, b]) => h("label", { class: "check" }, b, ev))),
+      h("button", { class: "btn", type: "submit", style: "margin-top:8px" }, "Add webhook")));
+
+  // Quick capture
+  const bookmarklet = `javascript:void(open('${ORIGIN}/_/#/links/new?url='+encodeURIComponent(location.href)))`;
+  const curl = `curl -X POST ${ORIGIN}/api/links \\\n  -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SECRET" \\\n  -H "Content-Type: application/json" -d '{"url":"https://example.com"}'`;
+  const toolsPanel = h("div", { class: "panel" }, h("h2", {}, "Quick capture"),
+    h("p", { class: "muted small" }, "Drag this to your bookmarks bar, then click it on any page to shorten that page:"),
+    h("p", {}, h("a", { class: "btn", href: bookmarklet, onclick: (e) => { e.preventDefault(); toast("Drag it to the bookmarks bar"); } }, "＋ Shorten with 301")),
+    h("p", { class: "muted small" }, "From scripts and the iOS Share Sheet, use an Access service token (add its client ID to the ADMIN_SERVICE_TOKENS variable):"),
+    h("pre", { class: "mono small code" }, curl),
+    h("p", { class: "muted small" }, "iOS Shortcut: new shortcut → Receive URLs from Share Sheet → Get Contents of URL (POST to /api/links, the two headers above, JSON body url = Shortcut Input) → Get Dictionary Value \"slug\" → Text “" + ORIGIN + "/[Dictionary Value]” → Copy to Clipboard. API reference: ", h("a", { href: "/_/openapi.yaml", target: "_blank" }, "openapi.yaml"), "."));
+
   $app.replaceChildren(
     h("div", { class: "page-head" }, h("h1", {}, "Settings")),
     h("div", { class: "grid g2" },
-      h("form", { class: "panel", onsubmit: save }, h("h2", {}, "Redirects"),
-        field("Root URL (301.xorio.rs/)", root), field("Unknown slug redirect", nf),
-        field("Default redirect type", red), field("Default slug style", style), field("Random slug length", len),
-        h("button", { class: "btn primary", type: "submit" }, "Save")),
-      h("div", { class: "grid" },
+      h("div", { class: "grid", style: "align-content:start" },
+        h("form", { class: "panel", onsubmit: save }, h("h2", {}, "Redirects"),
+          field("Root URL (301.xorio.rs/)", root), field("Unknown slug redirect", nf),
+          field("Default redirect type", red), field("Default slug style", style), field("Random slug length", len),
+          field("Keep raw click rows for (days)", retention, "0 keeps them forever. Totals on each link are always kept."),
+          status.backups && field("Keep nightly backups for (days)", keep),
+          h("div", { class: "hint" }, status.analytics_engine ? "Clicks are logged to Analytics Engine (no database writes per click)." : "Clicks are logged to D1. Set the ANALYTICS_API_TOKEN secret to move them to Analytics Engine."),
+          h("button", { class: "btn primary", type: "submit", style: "margin-top:10px" }, "Save")),
+        hookPanel, toolsPanel),
+      h("div", { class: "grid", style: "align-content:start" },
+        backupPanel,
         h("div", { class: "panel" }, h("h2", {}, "Export"), h("p", { class: "muted small" }, "All links with their settings and click counts."),
           h("div", { class: "row" }, h("a", { class: "btn", href: "/api/export?format=csv" }, "Download CSV"), h("a", { class: "btn", href: "/api/export?format=json" }, "Download JSON"))),
         h("div", { class: "panel" }, h("h2", {}, "Maintenance"), h("p", { class: "muted small" }, "Rewrites every link's edge record from the database. Only needed after manual database edits."), rebuildBtn),
         h("div", { class: "panel" }, h("h2", {}, "Appearance"), field("Theme", theme)))),
   );
+  loadHooks().catch((e) => hookList.replaceChildren(h("p", { class: "bad small" }, e.message)));
+  loadBackups();
 }
+
+// ---------- features presentation ----------
+const chip = (txt, cls = "") => h("span", { class: "fx-chip " + cls }, txt);
+const flow = (...steps) => h("div", { class: "fx-flow" }, steps.map((s, i) => [i ? h("span", { class: "fx-arrow" }, "→") : null, s]));
+const SLIDES = [
+  { kicker: "301", title: "A personal link shortener that runs on the edge", lede: "One Rust Worker on Cloudflare. Short links answer from the nearest location; everything you set up lives in your own account.",
+    visual: () => flow(chip(location.host + "/launch", "mono accent"), chip("1 KV read"), chip("example.com/a/very/long/path?with=params", "mono")),
+    points: ["Rust compiled to WebAssembly, Workers KV for the hot path, D1 as the source of truth", "Admin UI and API behind Cloudflare Access", "Free plan friendly"] },
+  { kicker: "Redirects", title: "Fast, predictable redirects", lede: "Every redirect is a single KV lookup; clicks are logged after the response is sent.",
+    visual: () => h("div", { class: "fx-row" }, ["301", "302", "307", "308"].map((c) => chip(c, "big"))),
+    points: ["Pick 301, 302, 307 or 308 per link", "Query strings pass through to the destination", "Add + to any short link to preview where it goes", "Renamed slugs keep working as aliases"] },
+  { kicker: "Slugs", title: "Short links that read well", lede: "Type your own, or generate one in the style you like.",
+    visual: () => h("div", { class: "fx-col" }, chip("/k7RmQ2x", "mono"), chip("/brave-otter-42", "mono"), chip("/curious-lovelace", "mono"), chip("/talks/rustconf", "mono accent")),
+    points: ["Random characters, words, or scientist names", "Case-sensitive custom slugs, with / for folders", "Live availability check while you type"] },
+  { kicker: "Rules", title: "Links that follow your rules", lede: "Decide who goes where, and for how long.",
+    visual: () => h("div", { class: "fx-col" }, flow(chip("iPhone"), chip("App Store")), flow(chip("RO"), chip(".ro page")), flow(chip("click 101"), chip("fallback page"))),
+    points: ["Expiry by date, or after an exact number of clicks (counted atomically)", "Fallback URL once a link expires", "Password protection (PBKDF2)", "Country and device targeting"] },
+  { kicker: "A/B split", title: "Test two destinations at once", lede: "Send a share of visitors to each variant and compare clicks per variant.",
+    visual: () => h("div", { class: "fx-split" }, [["A", 50], ["B", 30], ["C", 20]].map(([k, w]) => h("div", { style: `flex:${w}` }, `${k} · ${w}%`))),
+    points: ["Up to four variants with weights in %", "The main URL gets whatever is left", "Device and country rules still win", "Per-variant clicks in the link's analytics"] },
+  { kicker: "Open in app", title: "Mobile deep links", lede: "On phones, try the native app first; if it is not installed, continue to the web page.",
+    visual: () => flow(chip("tap link"), chip("myapp://item/42", "mono accent"), chip("no app? web page")),
+    points: ["Separate iOS and Android app links", "Falls back to the web destination or the device rule", "Dangerous schemes are refused"] },
+  { kicker: "Social previews", title: "Your own card in Slack, X and iMessage", lede: "Chat apps and social networks see the title, description and image you choose. People still go straight to the destination.",
+    visual: () => h("div", { class: "og-card fx-card" }, h("div", { class: "og-noimg muted small" }, "1200 × 630"), h("div", { class: "og-body" }, h("div", { class: "muted small" }, location.host), h("b", {}, "Spring launch: what's new"), h("div", { class: "small muted" }, "Everything we shipped this season, in two minutes."))),
+    points: ["Open Graph and Twitter card tags", "Live preview while you edit", "Password-protected links never leak their destination"] },
+  { kicker: "Marketing", title: "UTM builder and QR codes", lede: "Campaign tags without typos, and QR codes that count their own scans.",
+    visual: () => h("div", { class: "fx-col" }, chip("utm_source=newsletter", "mono"), chip("utm_campaign=spring-launch", "mono"), chip("QR scans: counted separately", "accent")),
+    points: ["UTM fields with a live preview of the final URL", "QR codes in SVG or PNG, any colours, any error correction", "Tags and private notes on every link"] },
+  { kicker: "Analytics", title: "Know what your links do", lede: "Clicks over time, with the context that matters, and no IP addresses stored.",
+    visual: () => h("div", { class: "fx-bars" }, [40, 65, 52, 80, 74, 95, 88].map((v) => h("div", { style: `height:${v}%` }))),
+    points: ["Countries, cities, referrers, devices, OS and browsers", "Bots and link-preview crawlers counted separately", "24h, 7, 30, 90 days or all time"] },
+  { kicker: "Scale", title: "Analytics Engine for clicks", lede: "With the token set, a click costs zero database writes, so the free-plan ceiling of about 50,000 clicks a day goes away.",
+    visual: () => flow(chip("click"), chip("Analytics Engine", "accent"), chip("every 10 min → totals")),
+    points: ["Falls back to D1 automatically without the token", "Old D1 clicks and new ones are added up in every chart", "Totals per link are rolled up by a cron job"] },
+  { kicker: "Health", title: "Broken-link checker", lede: "Every destination is checked about once a day; dead links show up on the dashboard.",
+    visual: () => h("div", { class: "fx-row" }, chip("200 OK", "good"), chip("404", "bad"), chip("503", "bad"), chip("no answer", "bad")),
+    points: ["HEAD first, GET when a site refuses HEAD", "Filter the link list by broken destinations", "Check now from any link page"] },
+  { kicker: "Automation", title: "Signed webhooks", lede: "Tell your other tools when links change or get clicked.",
+    visual: () => h("div", { class: "fx-col" }, ["link.created", "link.updated", "link.deleted", "click"].map((e) => chip(e, "mono"))),
+    points: ["JSON POSTs signed with HMAC-SHA256", "Send a test delivery from Settings", "Last delivery status on every hook"] },
+  { kicker: "Moving in", title: "Import and export", lede: "Bring your links from another service in a few clicks, and take them anywhere.",
+    visual: () => h("div", { class: "fx-row" }, ["Bitly", "Rebrandly", "Short.io", "TinyURL", "CSV"].map((s) => chip(s))),
+    points: ["API importers and CSV auto-detection (Dub exports too)", "Skip, rename or overwrite on conflicts", "CSV and JSON export of everything"] },
+  { kicker: "Safety net", title: "Nightly backups and retention", lede: "Every night the whole admin state is written to R2.",
+    visual: () => h("div", { class: "fx-col" }, ["daily/2026-11-06.json", "daily/2026-11-05.json", "daily/2026-11-04.json"].map((k) => chip(k, "mono"))),
+    points: ["Links, aliases, settings and webhooks, downloadable from Settings", "Old backups and raw click rows pruned on your schedule", "D1 Time Travel on top for point-in-time restore"] },
+  { kicker: "Capture", title: "Shorten from anywhere", lede: "A bookmarklet, an iOS Share Sheet shortcut, or the API.",
+    visual: () => flow(chip("any page"), chip("＋ Shorten with 301", "accent"), chip("copied")),
+    points: ["Paste a URL anywhere in the admin, or press n", "Access service tokens for scripts", "OpenAPI spec for every endpoint"] },
+  { kicker: "Under the hood", title: "Secure and easy to run", lede: "Locked down by default, deployed by CI.",
+    visual: () => h("div", { class: "fx-row" }, chip("Access + JWT check"), chip("per-IP rate limit"), chip("e2e tests"), chip("staging")),
+    points: ["Cloudflare Access in front, Access JWT verified again in the Worker", "Per-IP rate limiting on redirects", "Unit and end-to-end tests, then deploy on push; one-click staging copy", "One variable to move to a custom domain"] },
+];
+
+function showFeatures() {
+  if (document.querySelector(".fx")) return;
+  let i = 0;
+  const stage = h("div", { class: "fx-stage" });
+  const dots = h("div", { class: "fx-dots" });
+  const counter = h("span", { class: "muted small" });
+  const prev = h("button", { class: "btn", "aria-label": "Previous", onclick: () => go(i - 1) }, "←");
+  const next = h("button", { class: "btn primary", "aria-label": "Next", onclick: () => go(i + 1) }, "→");
+  const full = h("button", { class: "btn", title: "Full screen (f)", onclick: () => toggleFull() }, "⛶");
+  const close = h("button", { class: "btn", title: "Close (Esc)", onclick: () => done() }, "✕");
+  const root = h("div", { class: "fx", role: "dialog", "aria-modal": "true", "aria-label": "Features" },
+    h("div", { class: "fx-top" }, h("span", { class: "brand" }, h("span", { class: "logo" }, "301"), h("span", {}, "Features")), h("div", { class: "row" }, full, close)),
+    stage,
+    h("div", { class: "fx-bottom" }, prev, dots, counter, next));
+  function go(n) {
+    i = Math.max(0, Math.min(SLIDES.length - 1, n));
+    const s = SLIDES[i];
+    stage.replaceChildren(h("section", { class: "fx-slide" },
+      h("div", { class: "fx-text" }, h("div", { class: "fx-kicker" }, s.kicker), h("h1", {}, s.title), h("p", { class: "fx-lede" }, s.lede),
+        h("ul", {}, s.points.map((p) => h("li", {}, p)))),
+      h("div", { class: "fx-visual" }, s.visual())));
+    dots.replaceChildren(...SLIDES.map((_, k) => h("button", { class: k === i ? "on" : "", "aria-label": `Slide ${k + 1}`, onclick: () => go(k) })));
+    counter.textContent = `${i + 1} / ${SLIDES.length}`;
+    prev.disabled = i === 0; next.disabled = i === SLIDES.length - 1;
+  }
+  const toggleFull = () => {
+    const p = document.fullscreenElement ? document.exitFullscreen() : root.requestFullscreen && root.requestFullscreen();
+    if (p && p.catch) p.catch(() => {});
+  };
+  const onKey = (e) => {
+    if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); go(i + 1); }
+    else if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); go(i - 1); }
+    else if (e.key === "Home") go(0);
+    else if (e.key === "End") go(SLIDES.length - 1);
+    else if (e.key === "f") toggleFull();
+    else if (e.key === "Escape" && !document.fullscreenElement) done();
+    e.stopPropagation();
+  };
+  let x0 = null;
+  root.addEventListener("touchstart", (e) => (x0 = e.touches[0].clientX), { passive: true });
+  root.addEventListener("touchend", (e) => { if (x0 == null) return; const dx = e.changedTouches[0].clientX - x0; if (Math.abs(dx) > 50) go(i + (dx < 0 ? 1 : -1)); x0 = null; });
+  function done() {
+    document.removeEventListener("keydown", onKey, true);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    root.remove();
+    document.body.style.overflow = "";
+  }
+  document.addEventListener("keydown", onKey, true);
+  document.body.style.overflow = "hidden";
+  document.body.append(root);
+  go(0);
+  next.focus();
+}
+document.getElementById("features").addEventListener("click", showFeatures);
 
 function applyTheme() {
   let t = "";

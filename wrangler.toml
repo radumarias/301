@@ -36,6 +36,26 @@ namespace_id = "3011"
   limit = 100
   period = 60
 
+# Cron jobs. Every 10 minutes: roll Analytics Engine clicks into link totals and check a
+# batch of destinations for broken links. Nightly (must match NIGHTLY in src/lib.rs):
+# R2 backup, backup pruning, click retention.
+[triggers]
+crons = ["*/10 * * * *", "17 3 * * *"]
+
+# >>> ae (scripts/provision.sh removes this block unless ANALYTICS_API_TOKEN is set)
+# Click analytics on Analytics Engine; stats are read back through the SQL API with the
+# ANALYTICS_API_TOKEN secret. Without it clicks keep going to D1.
+[[analytics_engine_datasets]]
+binding = "CLICKS_AE"
+dataset = "xorio_301_clicks"
+# <<< ae
+
+# >>> r2 (scripts/provision.sh removes this block when R2 is not enabled on the account)
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "xorio-301-backups"
+# <<< r2
+
 [vars]
 # Set by scripts/provision.sh from the Cloudflare Access application.
 ACCESS_TEAM_DOMAIN = ""
@@ -44,3 +64,7 @@ ACCESS_AUD = ""
 ADMIN_EMAILS = ""
 # Comma-separated Access service token client IDs (common_name) allowed into the API.
 ADMIN_SERVICE_TOKENS = ""
+# Account that owns the Analytics Engine dataset (set by scripts/provision.sh).
+CLOUDFLARE_ACCOUNT_ID = ""
+# Must match the dataset above.
+AE_DATASET = "xorio_301_clicks"

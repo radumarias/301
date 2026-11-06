@@ -1,0 +1,360 @@
+openapi: 3.1.0
+info:
+  title: 301 admin API
+  version: "1.1"
+  description: |
+    Admin API of the 301 URL shortener. Every route sits behind Cloudflare Access:
+    from a browser, sign in to the admin UI first; from scripts, send an Access
+    service token (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) whose client ID
+    is listed in the `ADMIN_SERVICE_TOKENS` variable. Browser writes must be same-origin.
+servers:
+  - url: /api
+security:
+  - accessServiceToken: []
+paths:
+  /me:
+    get:
+      summary: Who is signed in
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { email: { type: string } } } } } }
+  /links:
+    get:
+      summary: List links
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Search slug, URL, title and notes }
+        - { name: tag, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [active, disabled, expired, protected, broken] } }
+        - { name: sort, in: query, schema: { type: string, enum: [created, clicks, slug, updated, last_click] } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: One page of links
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Link" } }
+                  total: { type: integer }
+    post:
+      summary: Create a link
+      description: Without `slug`, one is generated in `slug_style` (or the default style).
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/LinkInput" } } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Link" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /links/bulk:
+    post:
+      summary: Tag, untag, disable, enable or delete up to 200 links
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, action]
+              properties:
+                ids: { type: array, items: { type: integer }, maxItems: 200 }
+                action: { type: string, enum: [tag, untag, disable, enable, delete] }
+                tags: { type: array, items: { type: string } }
+      responses:
+        "200": { description: Result, content: { application/json: { schema: { type: object, properties: { done: { type: integer }, errors: { type: array, items: { type: object } } } } } } }
+  /links/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      summary: Get a link
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Link" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Update a link
+      description: Only the fields sent change; `null` clears a nullable field. Renaming the slug keeps the old one as an alias.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/LinkInput" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Link" } } } }
+    delete:
+      summary: Delete a link with its aliases and clicks
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+  /links/{id}/aliases/{alias}:
+    delete:
+      summary: Remove an alias
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: alias, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+  /links/{id}/stats:
+    get:
+      summary: Analytics for one link
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { $ref: "#/components/parameters/Range" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } }
+  /links/{id}/check:
+    post:
+      summary: Check the destination now (broken-link checker)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } }
+  /links/{id}/qr.svg:
+    get:
+      summary: QR code
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: fg, in: query, schema: { type: string, example: "000000" } }
+        - { name: bg, in: query, schema: { type: string, example: "ffffff" } }
+        - { name: ecc, in: query, schema: { type: string, enum: [L, M, Q, H] } }
+        - { name: size, in: query, schema: { type: integer, default: 512 } }
+        - { name: track, in: query, schema: { type: string, enum: ["0", "1"] }, description: "0 leaves out the ?qr=1 scan marker" }
+      responses:
+        "200": { description: SVG, content: { image/svg+xml: {} } }
+  /slug:
+    get:
+      summary: Generate a free slug
+      parameters:
+        - { name: style, in: query, schema: { type: string, enum: [random, words, names] } }
+        - { name: length, in: query, schema: { type: integer } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { slug: { type: string } } } } } }
+  /slug/check:
+    get:
+      summary: Validate a slug and see who owns it
+      parameters: [{ name: slug, in: query, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { valid: { type: boolean }, reason: { type: [string, "null"] }, taken_by: { type: [integer, "null"] } } } } } }
+  /stats:
+    get:
+      summary: Analytics across all links
+      parameters: [{ $ref: "#/components/parameters/Range" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } }
+  /tags:
+    get:
+      summary: Tags with link counts
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { tag: { type: string }, n: { type: integer } } } } } } }
+  /settings:
+    get:
+      summary: Settings
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Settings" } } } }
+    put:
+      summary: Replace settings
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/Settings" } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Settings" } } } }
+  /status:
+    get:
+      summary: Which optional features are switched on
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  analytics_engine: { type: boolean }
+                  backups: { type: boolean }
+                  last_backup: { type: [object, "null"], properties: { key: { type: string }, at: { type: integer } } }
+                  webhook_events: { type: array, items: { type: string } }
+  /webhooks:
+    get:
+      summary: List webhooks
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Webhook" } } } } }
+    post:
+      summary: Add a webhook (a signing secret is generated)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url: { type: string, format: uri }
+                events: { type: array, items: { $ref: "#/components/schemas/WebhookEvent" } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Webhook" } } } }
+  /webhooks/{id}:
+    delete:
+      summary: Delete a webhook
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+  /webhooks/{id}/test:
+    post:
+      summary: Send a `test` event
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { description: Delivery result, content: { application/json: { schema: { type: object, properties: { status: { type: integer }, error: { type: [string, "null"] } } } } } }
+  /backups:
+    get:
+      summary: List R2 backups (newest first)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { key: { type: string }, size: { type: integer }, uploaded: { type: integer } } } } } } }
+        "503": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Back up now
+      responses:
+        "201": { description: Written, content: { application/json: { schema: { type: object, properties: { key: { type: string } } } } } }
+  /backups/download:
+    get:
+      summary: Download one backup
+      parameters: [{ name: key, in: query, required: true, schema: { type: string, example: daily/2026-11-06.json } }]
+      responses:
+        "200": { description: The backup JSON, content: { application/json: {} } }
+  /import/fetch:
+    post:
+      summary: Fetch one page of links from Bitly, Rebrandly, Short.io or TinyURL
+      responses: { "200": { description: OK } }
+  /import/commit:
+    post:
+      summary: Save imported links with a conflict policy (skip, rename, overwrite)
+      responses: { "200": { description: OK } }
+  /export:
+    get:
+      summary: Export every link
+      parameters: [{ name: format, in: query, schema: { type: string, enum: [csv, json], default: csv } }]
+      responses: { "200": { description: File download } }
+  /maintenance/rebuild-kv:
+    post:
+      summary: Rewrite 100 KV records after `after` (call until next_after is null)
+      parameters: [{ name: after, in: query, schema: { type: integer, default: 0 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { written: { type: integer }, next_after: { type: [integer, "null"] } } } } } }
+components:
+  securitySchemes:
+    accessServiceToken:
+      type: apiKey
+      in: header
+      name: CF-Access-Client-Id
+      description: Also send CF-Access-Client-Secret.
+  parameters:
+    Range:
+      name: range
+      in: query
+      schema: { type: string, enum: [24h, 7d, 30d, 90d, all], default: 30d }
+  responses:
+    Ok:
+      description: OK
+      content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } }
+    Error:
+      description: Error
+      content: { application/json: { schema: { type: object, properties: { error: { type: string } } } } }
+  schemas:
+    Utm:
+      type: object
+      properties: { source: { type: string }, medium: { type: string }, campaign: { type: string }, term: { type: string }, content: { type: string } }
+    Device:
+      type: object
+      description: Destination per device; wins over country rules.
+      properties: { ios: { type: string }, android: { type: string }, desktop: { type: string } }
+    Og:
+      type: object
+      description: Card shown to link-preview crawlers (Slack, X, iMessage, WhatsApp...).
+      properties: { title: { type: string, maxLength: 300 }, description: { type: string, maxLength: 1000 }, image: { type: string, format: uri } }
+    Variant:
+      type: object
+      description: Extra A/B destination; the main URL gets 100 minus the sum of weights.
+      required: [url, weight]
+      properties: { url: { type: string, format: uri }, weight: { type: integer, minimum: 1, maximum: 99 } }
+    AppLinks:
+      type: object
+      description: App URIs tried first on phones, falling back to the web destination.
+      properties: { ios: { type: string, example: "myapp://item/42" }, android: { type: string } }
+    Health:
+      type: object
+      properties:
+        code: { type: integer, description: HTTP status; 0 when the request failed }
+        error: { type: string }
+        checked_at: { type: integer }
+        broken: { type: boolean, description: "0, 404, 410 or 5xx" }
+    LinkInput:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        slug: { type: string }
+        slug_style: { type: string, enum: [random, words, names] }
+        title: { type: [string, "null"] }
+        notes: { type: [string, "null"] }
+        tags: { type: array, items: { type: string } }
+        add_tags: { type: array, items: { type: string } }
+        remove_tags: { type: array, items: { type: string } }
+        redirect_type: { type: integer, enum: [301, 302, 307, 308] }
+        disabled: { type: boolean }
+        expires_at: { type: [integer, "null"], description: Unix ms }
+        max_clicks: { type: [integer, "null"] }
+        fallback_url: { type: [string, "null"] }
+        password: { type: [string, "null"], description: Plain text; empty or null removes it }
+        passthrough: { type: boolean }
+        utm: { $ref: "#/components/schemas/Utm" }
+        geo: { type: object, additionalProperties: { type: string }, description: "ISO country code to URL" }
+        device: { $ref: "#/components/schemas/Device" }
+        og: { $ref: "#/components/schemas/Og" }
+        variants: { type: array, maxItems: 4, items: { $ref: "#/components/schemas/Variant" } }
+        app: { $ref: "#/components/schemas/AppLinks" }
+    Link:
+      allOf:
+        - $ref: "#/components/schemas/LinkInput"
+        - type: object
+          properties:
+            id: { type: integer }
+            has_password: { type: boolean }
+            source: { type: string }
+            clicks: { type: integer }
+            last_click_at: { type: [integer, "null"] }
+            created_at: { type: integer }
+            updated_at: { type: integer }
+            aliases: { type: array, items: { type: string } }
+            status: { type: string, enum: [active, disabled, expired] }
+            health: { oneOf: [{ $ref: "#/components/schemas/Health" }, { type: "null" }] }
+    Stats:
+      type: object
+      properties:
+        range: { type: string }
+        bucket_ms: { type: integer }
+        since: { type: integer }
+        clicks: { type: integer }
+        bots: { type: integer }
+        qr: { type: integer }
+        series: { type: array, items: { type: object, properties: { t: { type: integer }, n: { type: integer } } } }
+        top: { type: object, description: "country, referrer, device, os, browser, city (and variant for one link): top 10 {k, n}" }
+        top_links: { type: array, items: { type: object } }
+        links: { type: integer }
+        broken: { type: integer }
+        analytics_engine: { type: boolean }
+        analytics_error: { type: [string, "null"] }
+    Settings:
+      type: object
+      properties:
+        root_url: { type: [string, "null"] }
+        not_found_url: { type: [string, "null"] }
+        default_redirect: { type: integer }
+        default_slug_style: { type: string }
+        default_slug_length: { type: integer }
+        click_retention_days: { type: integer, description: "0 keeps raw clicks forever, else at least 7" }
+        backup_keep_days: { type: integer }
+    WebhookEvent:
+      type: string
+      enum: [link.created, link.updated, link.deleted, click]
+    Webhook:
+      type: object
+      description: |
+        Deliveries are POSTs of {"event", "at", "data"} with headers X-301-Event and
+        X-301-Signature: sha256=<hex HMAC-SHA256 of the raw body using the secret>.
+      properties:
+        id: { type: integer }
+        url: { type: string }
+        events: { type: array, items: { $ref: "#/components/schemas/WebhookEvent" } }
+        secret: { type: string }
+        created_at: { type: integer }
+        last_status: { type: [integer, "null"] }
+        last_error: { type: [string, "null"] }
+        last_at: { type: [integer, "null"] }

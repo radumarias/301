@@ -1,8 +1,8 @@
 //! The public redirect path: one KV read on the hot path, analytics after the response.
 
-use crate::model::passthrough_query;
+use crate::model::{passthrough_query, KvRecord};
 use crate::store::{self, Click};
-use crate::{pages, ua, util};
+use crate::{pages, ua, util, webhooks};
 use worker::{Context, Env, Method, Request, Response, Result};
 
 fn decode_path(path: &str) -> String {
@@ -95,20 +95,35 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         };
     };
 
+    if needs_fill {
+        // Read-through: cache the D1 record in KV after the response is sent.
+        let (fill_env, fill_slug, fill_rec) = (env.clone(), slug.clone(), rec.clone());
+        ctx.wait_until(async move {
+            let _ = store::fill_kv(&fill_env, &fill_slug, &fill_rec).await;
+        });
+    }
+
     if rec.disabled {
         return pages::gone("It was disabled by its owner.");
     }
     let now = util::now_ms();
-    let expired = rec.expires_at.is_some_and(|e| now >= e)
-        || match rec.max_clicks {
-            Some(m) => store::click_count(&env, rec.id).await.unwrap_or(0) >= m,
-            None => false,
-        };
-    if expired {
-        return match &rec.fallback {
-            Some(f) => util::redirect(f, 302),
-            None => pages::gone("It has expired."),
-        };
+    if rec.expires_at.is_some_and(|e| now >= e) || rec.exhausted {
+        return expired(&rec);
+    }
+
+    let ua_str = req
+        .headers()
+        .get("User-Agent")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let is_get = req.method() == Method::Get;
+
+    // Chat apps and social networks get the custom preview card instead of a redirect.
+    if is_get && !preview && !rec.og.is_empty() && ua::is_preview_crawler(&ua_str) {
+        let dest = rec.pw.is_none().then_some(rec.url.as_str());
+        log_click(&req, &env, &ctx, &rec, &slug, now, ClickExtra::bot());
+        return pages::social_card(&rec.og, dest);
     }
 
     let url = req.url()?;
@@ -125,18 +140,12 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         }
     }
 
-    let ua_str = req
-        .headers()
-        .get("User-Agent")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
     let info = ua::parse(&ua_str);
     let cf = req.cf();
     let country = cf.and_then(|c| c.country());
-    let city = cf.and_then(|c| c.city());
 
-    let dest = rec.destination(info.os, info.device, country.as_deref());
+    let roll = crate::crypto::random_bytes(1)[0] % 100;
+    let (dest, variant) = rec.destination(info.os, info.device, country.as_deref(), roll);
     let dest = if rec.passthrough {
         passthrough_query(dest, url.query())
     } else {
@@ -147,36 +156,48 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         return pages::preview(&slug, &dest);
     }
 
-    if needs_fill {
-        // Read-through: cache the D1 record in KV after the response is sent.
-        let (fill_env, fill_slug, fill_rec) = (env.clone(), slug.clone(), rec.clone());
-        ctx.wait_until(async move {
-            let _ = store::fill_kv(&fill_env, &fill_slug, &fill_rec).await;
-        });
+    let bot = info.bot || req.method() == Method::Head;
+
+    // Click limits: count atomically before redirecting, so the limit is exact. Once it
+    // is used up the KV record says so and later visitors cost no D1 access at all.
+    let mut counted = false;
+    if rec.max_clicks.is_some() && !bot {
+        match store::consume_click(&env, rec.id, now).await {
+            Ok(store::Consume::Counted { last }) => {
+                counted = true;
+                if last {
+                    resync_later(&env, &ctx, rec.id);
+                }
+            }
+            Ok(store::Consume::Exhausted) => {
+                resync_later(&env, &ctx, rec.id);
+                return expired(&rec);
+            }
+            // Fail open: a D1 hiccup should not break the link.
+            Err(e) => worker::console_error!("click limit check failed: {e}"),
+        }
     }
 
-    let qr = url.query_pairs().any(|(k, _)| k == "qr");
-    let click_env = env.clone();
-    let referrer = referrer_host(&req);
-    let is_head = req.method() == Method::Head;
-    let link_id = rec.id;
-    ctx.wait_until(async move {
-        let click = Click {
-            link_id,
-            ts: now,
-            country,
-            city,
-            referrer,
-            device: info.device,
-            os: info.os,
-            browser: info.browser,
-            bot: info.bot || is_head,
-            qr,
-        };
-        if let Err(e) = store::record_click(&click_env, click).await {
-            worker::console_error!("click write failed: {e}");
+    log_click(
+        &req,
+        &env,
+        &ctx,
+        &rec,
+        &slug,
+        now,
+        ClickExtra {
+            bot,
+            variant,
+            counted,
+        },
+    );
+
+    // Phones with an app link try the app first and fall back to the web destination.
+    if is_get && !bot {
+        if let Some(app) = rec.app.for_os(info.os) {
+            return pages::open_app(app, &dest);
         }
-    });
+    }
 
     // A password form POST must become a GET at the destination.
     let status = if rec.pw.is_some() {
@@ -185,4 +206,102 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         rec.redirect_type
     };
     util::redirect(&dest, status)
+}
+
+fn expired(rec: &KvRecord) -> Result<Response> {
+    match &rec.fallback {
+        Some(f) => util::redirect(f, 302),
+        None => pages::gone("It has expired."),
+    }
+}
+
+/// Rewrites the link's KV records from D1 after the response (e.g. limit reached).
+fn resync_later(env: &Env, ctx: &Context, id: i64) {
+    let env = env.clone();
+    ctx.wait_until(async move {
+        if let Err(e) = store::resync(&env, id).await {
+            worker::console_error!("kv resync failed: {}", e.public_message());
+        }
+    });
+}
+
+struct ClickExtra {
+    bot: bool,
+    variant: Option<u8>,
+    counted: bool,
+}
+
+impl ClickExtra {
+    fn bot() -> Self {
+        ClickExtra {
+            bot: true,
+            variant: None,
+            counted: false,
+        }
+    }
+}
+
+/// Logs the click (and fires click webhooks) after the response is sent.
+fn log_click(
+    req: &Request,
+    env: &Env,
+    ctx: &Context,
+    rec: &KvRecord,
+    slug: &str,
+    now: i64,
+    extra: ClickExtra,
+) {
+    let ua_str = req
+        .headers()
+        .get("User-Agent")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let qr = req
+        .url()
+        .map(|u| u.query_pairs().any(|(k, _)| k == "qr"))
+        .unwrap_or(false);
+    let cf = req.cf();
+    let country = cf.and_then(|c| c.country());
+    let city = cf.and_then(|c| c.city());
+    let referrer = referrer_host(req);
+    let env = env.clone();
+    let link_id = rec.id;
+    let slug = slug.to_string();
+    ctx.wait_until(async move {
+        let info = ua::parse(&ua_str);
+        let click = Click {
+            link_id,
+            slug: &slug,
+            ts: now,
+            country,
+            city,
+            referrer,
+            device: info.device,
+            os: info.os,
+            browser: info.browser,
+            bot: info.bot || extra.bot,
+            qr,
+            variant: extra.variant,
+            counted: extra.counted,
+        };
+        if let Err(e) = store::record_click(&env, &click).await {
+            worker::console_error!("click write failed: {e}");
+        }
+        if !click.bot && webhooks::wants_clicks(&env).await {
+            let data = serde_json::json!({
+                "link": { "id": click.link_id, "slug": click.slug },
+                "ts": click.ts,
+                "country": click.country,
+                "city": click.city,
+                "referrer": click.referrer,
+                "device": click.device,
+                "os": click.os,
+                "browser": click.browser,
+                "qr": click.qr,
+                "variant": click.variant,
+            });
+            webhooks::fire(&env, "click", data).await;
+        }
+    });
 }
