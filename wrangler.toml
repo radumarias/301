@@ -25,10 +25,17 @@ database_id = "REPLACE_D1_ID"
 migrations_dir = "migrations"
 
 [vars]
-# Set by scripts/provision.sh from the Cloudflare Access application.
+# Set by scripts/provision.sh from the Cloudflare Access application (empty when
+# Google sign-in is used instead).
 ACCESS_TEAM_DOMAIN = ""
 ACCESS_AUD = ""
 # Comma-separated emails allowed into the admin.
 ADMIN_EMAILS = ""
 # Comma-separated Access service token client IDs (common_name) allowed into the API.
 ADMIN_SERVICE_TOKENS = ""
+# Google sign-in (OAuth client ID; GOOGLE_CLIENT_SECRET is a Worker secret). When set,
+# scripts/provision.sh removes the Cloudflare Access app so anyone can sign in.
+GOOGLE_CLIENT_ID = ""
+# Cloudflare Turnstile site key (TURNSTILE_SECRET is a Worker secret). Anonymous links
+# stay off until both are set. SAFE_BROWSING_KEY (optional secret) enables URL checks.
+TURNSTILE_SITE_KEY = ""

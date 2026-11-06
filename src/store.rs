@@ -14,7 +14,8 @@ use worker::{D1Database, D1PreparedStatement, Env, KvStore};
 
 pub const KV_CACHE_TTL: u64 = 60;
 
-pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at";
+pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at, \
+     owner_id, manage_hash, creator_ip, blocked, (SELECT email FROM users WHERE users.id = links.owner_id) AS owner_email";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -84,7 +85,7 @@ pub fn n(v: i64) -> JsValue {
 pub fn on(v: Option<i64>) -> JsValue {
     v.map(n).unwrap_or(JsValue::NULL)
 }
-fn b(v: bool) -> JsValue {
+pub fn b(v: bool) -> JsValue {
     n(v as i64)
 }
 fn json_or_null<T: Serialize>(v: &T, empty: bool) -> JsValue {
@@ -112,6 +113,14 @@ pub struct Settings {
     pub default_redirect: u16,
     pub default_slug_style: String,
     pub default_slug_length: usize,
+    /// Anyone can create links without signing in (also needs Turnstile configured).
+    pub anon_enabled: bool,
+    /// Anonymous links expire after this many days.
+    pub anon_ttl_days: i64,
+    /// Anonymous links one IP may create per hour.
+    pub anon_per_hour: i64,
+    /// Links a signed-in (non-admin) user may create per day.
+    pub user_per_day: i64,
 }
 
 impl Default for Settings {
@@ -122,6 +131,10 @@ impl Default for Settings {
             default_redirect: 302,
             default_slug_style: "random".into(),
             default_slug_length: 7,
+            anon_enabled: true,
+            anon_ttl_days: 30,
+            anon_per_hour: 10,
+            user_per_day: 100,
         }
     }
 }
@@ -134,6 +147,12 @@ impl Settings {
         validate_redirect_type(self.default_redirect)?;
         if !(4..=32).contains(&self.default_slug_length) {
             return Err("default_slug_length must be between 4 and 32".into());
+        }
+        if !(1..=365).contains(&self.anon_ttl_days) {
+            return Err("anonymous links must expire after 1 to 365 days".into());
+        }
+        if !(0..=1000).contains(&self.anon_per_hour) || !(0..=10_000).contains(&self.user_per_day) {
+            return Err("creation limits must be between 0 and 1000 (anonymous, per hour) and 0 and 10000 (per user, per day)".into());
         }
         Ok(())
     }
@@ -336,21 +355,30 @@ fn link_binds(l: &Link) -> Vec<JsValue> {
 
 pub fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
     let mut binds = link_binds(l);
-    binds.push(n(l.created_at));
+    binds.extend([
+        n(l.created_at),
+        on(l.owner_id),
+        os(&l.manage_hash),
+        os(&l.creator_ip),
+        b(l.blocked),
+    ]);
     db.prepare(
-        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING id",
+        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, \
+         created_at, owner_id, manage_hash, creator_ip, blocked) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22) RETURNING id",
     )
     .bind(&binds)
 }
 
+/// Ownership columns are not written here: see `claim_*` in `account`.
 pub fn update_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
     let mut binds = link_binds(l);
+    binds.push(b(l.blocked));
     binds.push(n(l.id));
     db.prepare(
         "UPDATE links SET slug = ?1, url = ?2, title = ?3, notes = ?4, tags = ?5, redirect_type = ?6, disabled = ?7, expires_at = ?8, \
-         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17 \
-         WHERE id = ?18",
+         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17, \
+         blocked = ?18 WHERE id = ?19",
     )
     .bind(&binds)
 }
@@ -377,9 +405,15 @@ pub async fn new_link(env: &Env, st: &Settings, input: &LinkInput, source: &str)
     Ok(link)
 }
 
-pub async fn create_link(env: &Env, input: &LinkInput) -> SResult<Link> {
+pub async fn create_link(env: &Env, input: &LinkInput, owner_id: Option<i64>) -> SResult<Link> {
     let st = settings(env).await.unwrap_or_default();
     let mut link = new_link(env, &st, input, "manual").await?;
+    link.owner_id = owner_id;
+    insert_link(env, link).await
+}
+
+/// Saves a link built with `new_link` and writes its KV record.
+pub async fn insert_link(env: &Env, mut link: Link) -> SResult<Link> {
     let row = insert_stmt(&db(env)?, &link)?.first::<IdRow>(None).await?;
     link.id = row
         .ok_or_else(|| {
@@ -453,6 +487,7 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
         let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
         for table in [
             "clicks WHERE link_id",
+            "reports WHERE link_id",
             "aliases WHERE link_id",
             "links WHERE id",
         ] {

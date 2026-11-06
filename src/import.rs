@@ -426,7 +426,8 @@ async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
     Ok(out)
 }
 
-pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
+/// Imported links belong to `owner` (the admin running the import).
+pub async fn commit(env: &Env, req: CommitRequest, owner: Option<i64>) -> SResult<CommitResult> {
     if req.rows.len() > 100 {
         return Err(StoreError::Bad(
             "at most 100 rows per commit; send them in chunks".into(),
@@ -551,6 +552,7 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
             continue;
         }
         link.slug = slug_v.clone();
+        link.owner_id = owner;
         link.created_at = row.created_at.unwrap_or(now);
         link.updated_at = now;
         stmts.push(store::insert_stmt(&d, &link)?);

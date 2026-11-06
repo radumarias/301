@@ -1,4 +1,4 @@
-//! WebCrypto helpers: random bytes, PBKDF2 password hashing, RS256 verification.
+//! WebCrypto helpers: random bytes, PBKDF2 password hashing, SHA-256/HMAC, RS256 verification.
 
 use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use js_sys::{Array, Object, Reflect, Uint8Array};
@@ -92,6 +92,53 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub fn b64url(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// A random, URL-safe token with `n` bytes of entropy.
+pub fn random_token(n: usize) -> String {
+    b64url(&random_bytes(n))
+}
+
+/// SHA-256 digest.
+pub async fn sha256(data: &[u8]) -> worker::Result<Vec<u8>> {
+    let s = subtle()?;
+    let digest = JsFuture::from(
+        s.digest_with_str_and_u8_array("SHA-256", data)
+            .map_err(err)?,
+    )
+    .await
+    .map_err(err)?;
+    Ok(Uint8Array::new(&digest).to_vec())
+}
+
+/// Stored form of a secret token (session or anonymous manage token).
+pub async fn token_hash(token: &str) -> worker::Result<String> {
+    Ok(b64url(&sha256(token.as_bytes()).await?))
+}
+
+/// HMAC-SHA-256.
+pub async fn hmac_sha256(key: &[u8], data: &[u8]) -> worker::Result<Vec<u8>> {
+    let s = subtle()?;
+    let algo = obj(&[("name", "HMAC".into()), ("hash", "SHA-256".into())])?;
+    let usages = Array::of1(&JsValue::from_str("sign"));
+    let key = JsFuture::from(
+        s.import_key_with_object("raw", &Uint8Array::from(key), &algo, false, &usages)
+            .map_err(err)?,
+    )
+    .await
+    .map_err(err)?;
+    let key: CryptoKey = key.unchecked_into();
+    let sig = JsFuture::from(
+        s.sign_with_str_and_u8_array("HMAC", &key, data)
+            .map_err(err)?,
+    )
+    .await
+    .map_err(err)?;
+    Ok(Uint8Array::new(&sig).to_vec())
 }
 
 pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {

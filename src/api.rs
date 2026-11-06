@@ -1,10 +1,12 @@
-//! Admin JSON API under `/api`. Every route requires a verified Access identity.
+//! JSON API under `/api`. A few routes are public (config, anonymous links, reports);
+//! the rest need a signed-in user. Admins see everything, users only their own links.
 
-use crate::auth::{self, AuthError};
+use crate::auth::{self, AuthError, Identity};
 use crate::model::{Link, LinkInput};
 use crate::slug::Style;
 use crate::store::{self, n, s, CountRow, SResult, StoreError};
 use crate::util::{self, csv_field, iso, json, json_error, now_ms};
+use crate::{account, anon, safety};
 use crate::{import, qr};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -50,7 +52,7 @@ macro_rules! body {
 }
 
 /// Rejects cross-site writes: browsers always send Origin on POST/PATCH/DELETE.
-fn same_origin(req: &Request) -> bool {
+pub fn same_origin(req: &Request) -> bool {
     if matches!(req.method(), Method::Get | Method::Head | Method::Options) {
         return true;
     }
@@ -61,12 +63,70 @@ fn same_origin(req: &Request) -> bool {
     }
 }
 
-pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
-    let who = match auth::verify(&req, &env).await {
-        Ok(w) => w,
-        Err(AuthError::NotConfigured(m)) => return json_error(m, 503),
-        Err(AuthError::Denied(m)) => return json_error(m, 403),
+/// Links a caller may see: admins see all, everyone else only their own.
+pub fn visible(who: &Identity, link: &Link) -> bool {
+    who.admin || link.owner_id == Some(who.user_id)
+}
+
+/// Loads a link the caller may see (404 otherwise, so ids of others' links are not confirmed).
+async fn owned(env: &Env, who: &Identity, id: i64) -> std::result::Result<Link, Response> {
+    match store::get_link(env, id).await {
+        Ok(Some(l)) if visible(who, &l) => Ok(l),
+        Ok(_) => Err(json_error("not found", 404).unwrap()),
+        Err(e) => Err(store_err(e.into()).unwrap()),
+    }
+}
+
+macro_rules! owned {
+    ($env:expr, $who:expr, $id:expr) => {
+        match owned($env, $who, $id).await {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
+        }
     };
+}
+
+/// Every destination a link can send visitors to.
+pub fn link_urls(l: &Link) -> Vec<String> {
+    let mut v = vec![l.url.clone()];
+    v.extend(l.fallback_url.clone());
+    v.extend(l.geo.values().cloned());
+    v.extend(
+        [&l.device.ios, &l.device.android, &l.device.desktop]
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    v.sort();
+    v.dedup();
+    v
+}
+
+fn own_host(req: &Request) -> String {
+    req.url()
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Safety checks for links saved by non-admins (admins are trusted).
+async fn check_destinations(
+    env: &Env,
+    req: &Request,
+    who: &Identity,
+    link: &Link,
+) -> std::result::Result<(), Response> {
+    if who.admin {
+        return Ok(());
+    }
+    safety::check_urls(env, &own_host(req), &link_urls(link))
+        .await
+        .map_err(|e| json_error(e, 400).unwrap())
+}
+
+const DAY_MS: i64 = 24 * 3_600_000;
+
+pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     if !same_origin(&req) {
         return json_error("cross-origin request refused", 403);
     }
@@ -79,6 +139,29 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         .trim_end_matches('/')
         .split('/')
         .collect();
+
+    // Public endpoints: no sign-in needed.
+    match (req.method(), segs.as_slice()) {
+        (Method::Get, ["config"]) => return anon::config(&env).await,
+        (Method::Post, ["anon", "links"]) => return anon::create(req, &env).await,
+        (Method::Get | Method::Delete, ["anon", token, rest @ ..]) => {
+            let token = token.to_string();
+            let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+            return anon::manage(&req, &env, &token, &rest, q("range")).await;
+        }
+        (Method::Post, ["report"]) => return anon::report(req, &env).await,
+        _ => {}
+    }
+
+    let who = match auth::identify(&req, &env).await {
+        Ok(Some(w)) => w,
+        Ok(None) => return json_error("sign in required", 401),
+        Err(AuthError::NotConfigured(m)) => return json_error(m, 503),
+        Err(AuthError::Denied(m)) => return json_error(m, 403),
+    };
+    // Regular users only ever see their own links.
+    let scope = (!who.admin).then_some(who.user_id);
+
     // `/api/links/<id>/...`: parse the id once.
     let link_id = match segs.as_slice() {
         ["links", id, ..] if *id != "bulk" => match id.parse::<i64>() {
@@ -87,55 +170,109 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         },
         _ => None,
     };
+    let admin_only = matches!(
+        (req.method(), segs.as_slice()),
+        (Method::Put, ["settings"])
+            | (_, ["import", ..])
+            | (_, ["maintenance", ..])
+            | (_, ["users", ..])
+            | (_, ["reports", ..])
+    );
+    if admin_only && !who.admin {
+        return json_error("admins only", 403);
+    }
 
     match (req.method(), segs.as_slice(), link_id) {
-        (Method::Get, ["me"], _) => json(&serde_json::json!({ "email": who.email }), 200),
+        (Method::Get, ["me"], _) => json(
+            &serde_json::json!({ "email": who.email, "name": who.name, "admin": who.admin, "user_id": who.user_id }),
+            200,
+        ),
+        (Method::Post, ["claim"], _) => {
+            #[derive(Deserialize)]
+            struct Claim {
+                tokens: Vec<String>,
+            }
+            let c: Claim = body!(req);
+            let moved = account::claim_anonymous(&env, who.user_id, &c.tokens).await?;
+            json(&serde_json::json!({ "claimed": moved }), 200)
+        }
 
-        (Method::Get, ["links"], _) => list_links(&env, &query).await,
+        (Method::Get, ["links"], _) => list_links(&env, &query, &who).await,
         (Method::Post, ["links"], _) => {
             let input: LinkInput = body!(req);
-            respond(store::create_link(&env, &input).await, 201)
+            if let Some(uid) = scope {
+                let st = store::settings(&env).await.unwrap_or_default();
+                let made = account::created_since(&env, Some(uid), None, now_ms() - DAY_MS).await?;
+                if made >= st.user_per_day {
+                    return json_error(
+                        format!(
+                            "You can create {} links a day. Try again tomorrow.",
+                            st.user_per_day
+                        ),
+                        429,
+                    );
+                }
+                let mut probe = Link::new(302, "manual");
+                if let Err(e) = input.apply(&mut probe) {
+                    return json_error(e, 400);
+                }
+                if let Err(r) = check_destinations(&env, &req, &who, &probe).await {
+                    return Ok(r);
+                }
+            }
+            respond(
+                store::create_link(&env, &input, Some(who.user_id)).await,
+                201,
+            )
         }
         (Method::Post, ["links", "bulk"], _) => {
             let b: Bulk = body!(req);
-            bulk(&env, b).await
+            bulk(&env, b, &who).await
         }
-        (Method::Get, ["links", _], Some(id)) => match store::get_link(&env, id).await? {
-            Some(l) => json(&l, 200),
-            None => json_error("not found", 404),
-        },
+        (Method::Get, ["links", _], Some(id)) => json(&owned!(&env, &who, id), 200),
         (Method::Patch | Method::Put, ["links", _], Some(id)) => {
             let input: LinkInput = body!(req);
-            respond(store::update_link(&env, id, &input).await, 200)
+            let link = owned!(&env, &who, id);
+            if !who.admin {
+                if link.blocked {
+                    return json_error(
+                        "This link was blocked by an admin and cannot be edited.",
+                        403,
+                    );
+                }
+                let mut probe = link.clone();
+                if let Err(e) = input.apply(&mut probe) {
+                    return json_error(e, 400);
+                }
+                if let Err(r) = check_destinations(&env, &req, &who, &probe).await {
+                    return Ok(r);
+                }
+            }
+            respond(store::update_loaded(&env, link, &input).await, 200)
         }
         (Method::Delete, ["links", _], Some(id)) => {
-            respond(store::delete_link(&env, id).await.map(|_| ok_json()), 200)
+            let link = owned!(&env, &who, id);
+            respond(
+                store::delete_links(&env, &[link]).await.map(|_| ok_json()),
+                200,
+            )
         }
-        (Method::Delete, ["links", _, "aliases", alias @ ..], Some(id)) => respond(
-            store::delete_alias(&env, id, &alias.join("/"))
-                .await
-                .map(|_| ok_json()),
-            200,
-        ),
+        (Method::Delete, ["links", _, "aliases", alias @ ..], Some(id)) => {
+            owned!(&env, &who, id);
+            respond(
+                store::delete_alias(&env, id, &alias.join("/"))
+                    .await
+                    .map(|_| ok_json()),
+                200,
+            )
+        }
         (Method::Get, ["links", _, "stats"], Some(id)) => {
-            stats(&env, Some(id), q("range").unwrap_or("30d")).await
+            owned!(&env, &who, id);
+            stats(&env, Some(id), q("range").unwrap_or("30d"), None).await
         }
         (Method::Get, ["links", _, "qr.svg"], Some(id)) => {
-            let Some(link) = store::get_link(&env, id).await? else {
-                return json_error("not found", 404);
-            };
-            let track = q("track") != Some("0");
-            let data = format!(
-                "{}/{}{}",
-                url.origin().ascii_serialization(),
-                link.slug,
-                if track { "?qr=1" } else { "" }
-            );
-            let size = q("size").and_then(|v| v.parse().ok()).unwrap_or(512);
-            match qr::svg(&data, q("fg"), q("bg"), q("ecc"), size) {
-                Ok(svg) => util::body(svg, "image/svg+xml"),
-                Err(e) => json_error(e, 400),
-            }
+            let link = owned!(&env, &who, id);
+            qr_svg(&url, &link, &query)
         }
         (Method::Get, ["slug"], _) => {
             let st = store::settings(&env).await.unwrap_or_default();
@@ -153,14 +290,23 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["slug", "check"], _) => {
             let slug = q("slug").unwrap_or_default();
             let valid = crate::slug::validate(slug);
-            let taken = store::slug_owner(&env, slug).await?;
+            let mut taken = store::slug_owner(&env, slug).await?;
+            // Do not reveal the ids of other people's links.
+            if let (Some(id), false) = (taken, who.admin) {
+                let mine = store::get_link(&env, id)
+                    .await?
+                    .is_some_and(|l| visible(&who, &l));
+                if !mine {
+                    taken = Some(-1);
+                }
+            }
             json(
                 &serde_json::json!({ "valid": valid.is_ok(), "reason": valid.err(), "taken_by": taken }),
                 200,
             )
         }
-        (Method::Get, ["stats"], _) => stats(&env, None, q("range").unwrap_or("30d")).await,
-        (Method::Get, ["tags"], _) => tags(&env).await,
+        (Method::Get, ["stats"], _) => stats(&env, None, q("range").unwrap_or("30d"), scope).await,
+        (Method::Get, ["tags"], _) => tags(&env, scope).await,
         (Method::Get, ["settings"], _) => json(&store::settings(&env).await?, 200),
         (Method::Put, ["settings"], _) => {
             let st: store::Settings = body!(req);
@@ -175,13 +321,53 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         }
         (Method::Post, ["import", "commit"], _) => {
             let b: import::CommitRequest = body!(req);
-            respond(import::commit(&env, b).await, 200)
+            respond(import::commit(&env, b, Some(who.user_id)).await, 200)
         }
-        (Method::Get, ["export"], _) => export(&env, q("format").unwrap_or("csv")).await,
+        (Method::Get, ["export"], _) => export(&env, q("format").unwrap_or("csv"), scope).await,
         (Method::Post, ["maintenance", "rebuild-kv"], _) => {
             rebuild_kv(&env, q("after").and_then(|v| v.parse().ok()).unwrap_or(0)).await
         }
+        (Method::Get, ["users"], _) => json(&account::list_users(&env).await?, 200),
+        (Method::Post, ["users", id], _) => {
+            #[derive(Deserialize)]
+            struct Ban {
+                banned: bool,
+            }
+            let Ok(id) = id.parse::<i64>() else {
+                return json_error("bad id", 400);
+            };
+            if id == who.user_id {
+                return json_error("you cannot ban yourself", 400);
+            }
+            let b: Ban = body!(req);
+            account::set_banned(&env, id, b.banned).await?;
+            json(&ok_json(), 200)
+        }
+        (Method::Get, ["reports"], _) => json(&account::open_reports(&env).await?, 200),
+        (Method::Post, ["reports", id, "resolve"], _) => {
+            let Ok(id) = id.parse::<i64>() else {
+                return json_error("bad id", 400);
+            };
+            account::resolve_report(&env, id, q("all") == Some("1")).await?;
+            json(&ok_json(), 200)
+        }
         _ => json_error("no such endpoint", 404),
+    }
+}
+
+fn qr_svg(url: &url::Url, link: &Link, query: &HashMap<String, String>) -> Result<Response> {
+    let q = |k: &str| query.get(k).map(String::as_str);
+    let track = q("track") != Some("0");
+    let data = format!(
+        "{}/{}{}",
+        url.origin().ascii_serialization(),
+        link.slug,
+        if track { "?qr=1" } else { "" }
+    );
+    let size = q("size").and_then(|v| v.parse().ok()).unwrap_or(512);
+    match qr::svg(&data, q("fg"), q("bg"), q("ecc"), size) {
+        Ok(svg) => util::body(svg, "image/svg+xml"),
+        Err(e) => json_error(e, 400),
     }
 }
 
@@ -195,12 +381,33 @@ struct Page<T> {
 
 const EXPIRED_SQL: &str = "((expires_at IS NOT NULL AND expires_at <= ?) OR (max_clicks IS NOT NULL AND clicks >= max_clicks))";
 
-async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> {
+async fn list_links(env: &Env, q: &HashMap<String, String>, who: &Identity) -> Result<Response> {
     let mut wheres: Vec<String> = vec![];
     let mut binds: Vec<JsValue> = vec![];
+    // Admins can filter by owner; everyone else is pinned to their own links.
+    let owner = if who.admin {
+        q.get("owner").map(String::as_str).unwrap_or("")
+    } else {
+        "me"
+    };
+    match owner {
+        "me" => {
+            binds.push(n(who.user_id));
+            wheres.push(format!("owner_id = ?{}", binds.len()));
+        }
+        "anon" => wheres.push("manage_hash IS NOT NULL".into()),
+        id if id.parse::<i64>().is_ok() => {
+            binds.push(n(id.parse().unwrap_or_default()));
+            wheres.push(format!("owner_id = ?{}", binds.len()));
+        }
+        _ => {}
+    }
     if let Some(text) = q.get("q").map(|t| t.trim()).filter(|t| !t.is_empty()) {
-        wheres.push("(slug LIKE ?1 OR url LIKE ?1 OR title LIKE ?1 OR notes LIKE ?1)".into());
         binds.push(s(&format!("%{text}%")));
+        let i = binds.len();
+        wheres.push(format!(
+            "(slug LIKE ?{i} OR url LIKE ?{i} OR title LIKE ?{i} OR notes LIKE ?{i})"
+        ));
     }
     if let Some(tag) = q.get("tag").filter(|t| !t.is_empty()) {
         wheres.push(format!(
@@ -213,6 +420,10 @@ async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> 
     let expired = EXPIRED_SQL.replace('?', &now_bind);
     match q.get("status").map(String::as_str) {
         Some("disabled") => wheres.push("disabled = 1".into()),
+        Some("blocked") => wheres.push("blocked = 1".into()),
+        Some("reported") => wheres.push(
+            "EXISTS (SELECT 1 FROM reports WHERE reports.link_id = links.id AND reports.resolved = 0)".into(),
+        ),
         Some("expired") => wheres.push(format!("disabled = 0 AND {expired}")),
         Some("active") => wheres.push(format!("disabled = 0 AND NOT {expired}")),
         Some("protected") => wheres.push("password_hash IS NOT NULL".into()),
@@ -273,14 +484,19 @@ async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> 
     json(&Page { items, total }, 200)
 }
 
-async fn tags(env: &Env) -> Result<Response> {
+async fn tags(env: &Env, scope: Option<i64>) -> Result<Response> {
     #[derive(Deserialize, Serialize)]
     struct Row {
         tag: String,
         n: i64,
     }
+    let (filter, binds) = match scope {
+        Some(uid) => ("WHERE links.owner_id = ?1", vec![n(uid)]),
+        None => ("", vec![]),
+    };
     let rows = store::db(env)?
-        .prepare("SELECT j.value AS tag, COUNT(*) AS n FROM links, json_each(links.tags) j GROUP BY j.value ORDER BY n DESC, tag")
+        .prepare(format!("SELECT j.value AS tag, COUNT(*) AS n FROM links, json_each(links.tags) j {filter} GROUP BY j.value ORDER BY n DESC, tag"))
+        .bind(&binds)?
         .all()
         .await?
         .results::<Row>()?;
@@ -297,12 +513,19 @@ struct Bulk {
     tags: Vec<String>,
 }
 
-async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
+async fn bulk(env: &Env, body: Bulk, who: &Identity) -> Result<Response> {
     if body.ids.len() > 200 {
         return json_error("at most 200 links per bulk action", 400);
     }
+    if matches!(body.action.as_str(), "block" | "unblock") && !who.admin {
+        return json_error("admins only", 403);
+    }
     let input = match body.action.as_str() {
         "delete" => None,
+        "block" | "unblock" => Some(LinkInput {
+            blocked: Some(body.action == "block"),
+            ..Default::default()
+        }),
         "disable" | "enable" => Some(LinkInput {
             disabled: Some(body.action == "disable"),
             ..Default::default()
@@ -326,6 +549,11 @@ async fn bulk(env: &Env, body: Bulk) -> Result<Response> {
         let marks = vec!["?"; chunk.len()].join(",");
         let ids: Vec<JsValue> = chunk.iter().map(|id| n(*id)).collect();
         links.extend(store::query_links(env, &format!("WHERE id IN ({marks})"), &ids).await?);
+    }
+    // Other people's links are silently left out; blocked ones stay as they are for users.
+    links.retain(|l| visible(who, l) && (who.admin || !l.blocked));
+    if links.is_empty() {
+        return json(&serde_json::json!({ "done": 0, "errors": [] }), 200);
     }
     let links = store::with_aliases(env, links).await?;
 
@@ -393,12 +621,22 @@ struct Bucket {
 
 const DIMENSIONS: [&str; 6] = ["country", "referrer", "device", "os", "browser", "city"];
 
-async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
+/// Click stats for one link, or across all links (`owner`: only that user's links).
+pub async fn stats(env: &Env, link: Option<i64>, r: &str, owner: Option<i64>) -> Result<Response> {
     let (since, bucket) = range(r);
     let d = store::db(env)?;
-    let (filter, binds): (&str, Vec<JsValue>) = match link {
-        Some(id) => ("link_id = ?1 AND ts >= ?2", vec![n(id), n(since)]),
-        None => ("ts >= ?1", vec![n(since)]),
+    let (filter, binds): (&str, Vec<JsValue>) = match (link, owner) {
+        (Some(id), _) => ("link_id = ?1 AND ts >= ?2", vec![n(id), n(since)]),
+        (None, Some(uid)) => (
+            "ts >= ?1 AND link_id IN (SELECT id FROM links WHERE owner_id = ?2)",
+            vec![n(since), n(uid)],
+        ),
+        (None, None) => ("ts >= ?1", vec![n(since)]),
+    };
+    let owner_and = if owner.is_some() {
+        " AND l.owner_id = ?2"
+    } else {
+        ""
     };
 
     // Everything in one D1 round trip.
@@ -423,13 +661,18 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
     }
     if link.is_none() {
         stmts.push(
-            d.prepare(
+            d.prepare(format!(
                 "SELECT l.id, l.slug, l.url, l.title, COUNT(*) AS n FROM clicks c JOIN links l ON l.id = c.link_id \
-                 WHERE c.ts >= ?1 AND c.bot = 0 GROUP BY l.id ORDER BY n DESC LIMIT 10",
-            )
+                 WHERE c.ts >= ?1 AND c.bot = 0{owner_and} GROUP BY l.id ORDER BY n DESC LIMIT 10"
+            ))
             .bind(&binds)?,
         );
-        stmts.push(d.prepare("SELECT COUNT(*) AS n FROM links"));
+        stmts.push(match owner {
+            Some(uid) => d
+                .prepare("SELECT COUNT(*) AS n FROM links WHERE owner_id = ?1")
+                .bind(&[n(uid)])?,
+            None => d.prepare("SELECT COUNT(*) AS n FROM links"),
+        });
     }
     let res = d.batch(stmts).await?;
 
@@ -472,20 +715,43 @@ async fn stats(env: &Env, link: Option<i64>, r: &str) -> Result<Response> {
 // ---- Export / maintenance ----
 
 /// One page of links (with aliases) after `after_id`, ordered by id (keyset paging).
-async fn links_after(env: &Env, after_id: i64, limit: i64) -> Result<Vec<Link>> {
-    let page = store::query_links(
-        env,
-        &format!("WHERE id > ?1 ORDER BY id LIMIT {limit}"),
-        &[n(after_id)],
-    )
-    .await?;
+async fn links_after(
+    env: &Env,
+    after_id: i64,
+    limit: i64,
+    owner: Option<i64>,
+) -> Result<Vec<Link>> {
+    let page = match owner {
+        Some(uid) => {
+            store::query_links(
+                env,
+                &format!("WHERE id > ?1 AND owner_id = ?2 ORDER BY id LIMIT {limit}"),
+                &[n(after_id), n(uid)],
+            )
+            .await?
+        }
+        None => {
+            store::query_links(
+                env,
+                &format!("WHERE id > ?1 ORDER BY id LIMIT {limit}"),
+                &[n(after_id)],
+            )
+            .await?
+        }
+    };
     store::with_aliases(env, page).await
 }
 
-async fn export(env: &Env, format: &str) -> Result<Response> {
+async fn export(env: &Env, format: &str, owner: Option<i64>) -> Result<Response> {
     let mut links = vec![];
     loop {
-        let page = links_after(env, links.last().map(|l: &Link| l.id).unwrap_or(0), 1000).await?;
+        let page = links_after(
+            env,
+            links.last().map(|l: &Link| l.id).unwrap_or(0),
+            1000,
+            owner,
+        )
+        .await?;
         let done = page.len() < 1000;
         links.extend(page);
         if done {
@@ -532,7 +798,7 @@ async fn export(env: &Env, format: &str) -> Result<Response> {
 
 async fn rebuild_kv(env: &Env, after: i64) -> Result<Response> {
     const PAGE: i64 = 100;
-    let links = links_after(env, after, PAGE).await?;
+    let links = links_after(env, after, PAGE, None).await?;
     let results =
         futures_util::future::join_all(links.iter().map(|l| store::sync_kv(env, l))).await;
     let written = results.iter().filter(|r| r.is_ok()).count();
