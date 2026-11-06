@@ -7,8 +7,15 @@ compatibility_date = "2026-10-01"
 workers_dev = true
 
 [build]
-command = "cargo install -q worker-build@^0.8 && worker-build --release"
+command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
 watch_dir = ["src", "ui", "migrations"]
+
+# Version preview URLs would expose the Worker on extra hosts outside the Access app.
+preview_urls = false
+
+# Daily click-retention purge (Settings -> Click retention).
+[triggers]
+crons = ["23 3 * * *"]
 
 [observability]
 enabled = true
@@ -44,3 +51,5 @@ ACCESS_AUD = ""
 ADMIN_EMAILS = ""
 # Comma-separated Access service token client IDs (common_name) allowed into the API.
 ADMIN_SERVICE_TOKENS = ""
+# Optional contact (email or URL) shown on the public /privacy page.
+PRIVACY_CONTACT = ""
