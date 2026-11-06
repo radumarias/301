@@ -50,6 +50,17 @@ pub fn gone(reason: &str) -> Result<Response> {
 
 /// `query` is the visitor's query string, kept on the form action so passthrough
 /// parameters and the `qr` marker survive the POST.
+pub fn too_many_requests(retry_after_secs: u32) -> Result<Response> {
+    let mut res = page(
+        429,
+        "Too many requests",
+        "<div class=code>429</div><h1>Slow down a little</h1><p>Too many requests from your network. Try again in a minute.</p>",
+    )?;
+    res.headers_mut()
+        .set("Retry-After", &retry_after_secs.to_string())?;
+    Ok(res)
+}
+
 pub fn password(slug: &str, query: Option<&str>, failed: bool) -> Result<Response> {
     let err = if failed {
         "<p class=err>Wrong password, try again.</p>"

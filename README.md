@@ -93,6 +93,13 @@ On the Workers free plan the limiting factor is D1 writes (2 per human click), s
 The $5/month Workers Paid plan covers about 25 million clicks a month. Imports write no KV entries; each
 link's edge record is filled on its first click.
 
+The public redirect path is rate limited per IP (100 requests a minute by default, set in the
+`[[ratelimits]]` block of `wrangler.toml`). Over the limit a visitor gets a `429` before any KV read or
+D1 write, which also slows down password guessing on protected links. The app and API (`/_/`, `/api/`) are not
+limited by it; creating links has its own per-IP and per-user limits. The Worker request itself is still counted; to drop abusive traffic before it reaches the Worker,
+add a WAF rate-limiting rule once the shortener is on a custom domain (WAF rules do not run on workers.dev).
+
 Opening it to the public stays on the free tiers at small scale: Google sign-in, Turnstile and Safe Browsing
-(non-commercial use) are free. Each new link costs one KV write (1,000 a day on the free plan) and one D1 write;
+(non-commercial use) are free. Each link made by a signed-in user costs one KV write (1,000 a day on the free plan) and one D1 write
+(anonymous links skip the KV write until their first click);
 signed-in API calls add one D1 read for the session. If creation volume grows past that, Workers Paid ($5/month) lifts both limits.

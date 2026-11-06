@@ -24,6 +24,18 @@ database_name = "xorio-301"
 database_id = "REPLACE_D1_ID"
 migrations_dir = "migrations"
 
+# Per-IP limit on the public redirect path (/_/ and /api/ are not limited). Over the
+# limit a visitor gets a 429 and no KV read or D1 write happens. period must be 10 or 60
+# seconds; namespace_id is any positive integer unique to this account. Counters are
+# kept per Cloudflare location, so the limit is approximate. Raise or lower `limit` to tune.
+[[ratelimits]]
+name = "REDIRECT_LIMITER"
+namespace_id = "3011"
+
+  [ratelimits.simple]
+  limit = 100
+  period = 60
+
 [vars]
 # Set by scripts/provision.sh from the Cloudflare Access application (empty when
 # Google sign-in is used instead).
