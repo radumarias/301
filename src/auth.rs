@@ -5,7 +5,7 @@
 //! fails closed instead of exposing the admin.
 
 use crate::crypto::{b64url_decode, verify_rs256};
-use crate::util::now_ms;
+use crate::util::{env_var as var, now_ms};
 use serde::Deserialize;
 use std::cell::RefCell;
 use worker::{Env, Fetch, Request};
@@ -53,14 +53,6 @@ thread_local! {
     static JWKS: RefCell<Option<(i64, String, Vec<serde_json::Value>)>> = const { RefCell::new(None) };
 }
 
-fn var(env: &Env, name: &str) -> String {
-    env.var(name)
-        .map(|v| v.to_string())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
 fn list(v: &str) -> Vec<String> {
     v.split(',')
         .map(|s| s.trim().to_lowercase())
@@ -80,12 +72,32 @@ fn token_from(req: &Request) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-async fn jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
+fn is_local(req: &Request) -> bool {
+    req.url()
+        .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+}
+
+const JWKS_TTL_MS: i64 = 3_600_000;
+/// An unknown `kid` (key rotation) refetches early, but at most this often, so forged
+/// tokens cannot turn every request into a fetch of the Access certs.
+const JWKS_MIN_REFRESH_MS: i64 = 60_000;
+
+fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
+    kid.is_none_or(|kid| {
+        keys.iter()
+            .any(|k| k.get("kid").and_then(|v| v.as_str()) == Some(kid))
+    })
+}
+
+async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
     let now = now_ms();
     let cached = JWKS.with(|c| {
         c.borrow()
             .as_ref()
-            .filter(|(at, t, _)| t == team && now - at < 3_600_000)
+            .filter(|(at, t, keys)| {
+                let age = now - at;
+                t == team && age < JWKS_TTL_MS && (age < JWKS_MIN_REFRESH_MS || has_kid(keys, kid))
+            })
             .map(|(_, _, k)| k.clone())
     });
     if let Some(k) = cached {
@@ -153,9 +165,9 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
     let aud = var(env, "ACCESS_AUD");
 
     // Local development only (`.dev.vars`). Ignored as soon as Access is configured,
-    // so it can never open a deployed Worker.
+    // and only honoured on a loopback host, so it can never open a deployed Worker.
     let dev = var(env, "DEV_AUTH_EMAIL");
-    if !dev.is_empty() && aud.is_empty() && team.is_empty() {
+    if !dev.is_empty() && aud.is_empty() && team.is_empty() && is_local(req) {
         return Ok(Identity { email: dev });
     }
 
@@ -192,7 +204,7 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
     let sig =
         b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
 
-    let keys = jwks(&team)
+    let keys = jwks(&team, header.kid.as_deref())
         .await
         .map_err(|e| AuthError::Denied(format!("could not fetch Access certs: {e}")))?;
     let candidates: Vec<&serde_json::Value> = keys
@@ -214,8 +226,17 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
         }
     }
     if !valid {
-        // Keys may have rotated: drop the cache so the next request refetches.
-        JWKS.with(|c| *c.borrow_mut() = None);
+        // Keys may have rotated under a token without a `kid` (which never triggers the
+        // early refetch): drop a cache older than the minimum refresh interval.
+        let now = now_ms();
+        JWKS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.as_ref()
+                .is_some_and(|(at, _, _)| now - at >= JWKS_MIN_REFRESH_MS)
+            {
+                *c = None;
+            }
+        });
         return Err(AuthError::Denied("invalid token signature".into()));
     }
     check_claims(
