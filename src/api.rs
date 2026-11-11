@@ -60,7 +60,12 @@ pub fn same_origin(req: &Request) -> bool {
         return true;
     }
     let Ok(url) = req.url() else { return false };
-    match req.headers().get("Origin").ok().flatten() {
+    let header = |k: &str| req.headers().get(k).ok().flatten();
+    // Fetch metadata, where the browser sends it, must not say cross-site.
+    if header("Sec-Fetch-Site").is_some_and(|v| v != "same-origin" && v != "none") {
+        return false;
+    }
+    match header("Origin") {
         Some(o) => o == url.origin().ascii_serialization(),
         None => true, // non-browser clients (service tokens)
     }
@@ -167,7 +172,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
 
     // Public endpoints: no sign-in needed.
     match (req.method(), segs.as_slice()) {
-        (Method::Get, ["config"]) => return anon::config(&env).await,
+        (Method::Get, ["config"]) => return anon::config(&req, &env).await,
         (Method::Post, ["anon", "links"]) => return anon::create(req, &env).await,
         (Method::Get | Method::Delete, ["anon", token, rest @ ..]) => {
             let token = token.to_string();

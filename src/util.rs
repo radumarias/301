@@ -56,14 +56,47 @@ pub fn parse_date_str(s: &str) -> Option<i64> {
     }
 }
 
-/// A plain response with a content type, no-store caching and nosniff.
+/// A plain response with a content type and no-store caching.
 pub fn body(content: impl Into<String>, ctype: &str) -> Result<Response> {
     let mut res = Response::ok(content)?;
     let h = res.headers_mut();
     h.set("Content-Type", ctype)?;
     h.set("Cache-Control", "no-store")?;
-    h.set("X-Content-Type-Options", "nosniff")?;
     Ok(res)
+}
+
+/// Security headers for every response, applied once in `lib.rs`. Pages that need a
+/// looser policy (the admin UI, visitor pages) set their own; everything else (API
+/// data, SVGs, redirects, errors) gets an inert default: no script, no framing.
+pub fn harden(res: &mut Response) -> Result<()> {
+    const DEFAULTS: [(&str, &str); 3] = [
+        (
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; sandbox",
+        ),
+        ("X-Frame-Options", "DENY"),
+        ("Referrer-Policy", "no-referrer"),
+    ];
+    let h = res.headers_mut();
+    for (k, v) in DEFAULTS {
+        if !h.has(k)? {
+            h.set(k, v)?;
+        }
+    }
+    h.set("X-Content-Type-Options", "nosniff")?;
+    h.set("Strict-Transport-Security", "max-age=31536000")?;
+    Ok(())
+}
+
+/// A trimmed environment variable, empty when unset.
+/// A Worker variable or, failing that, a secret of that name (trimmed, empty if unset).
+pub fn env_var(env: &worker::Env, name: &str) -> String {
+    env.var(name)
+        .map(|v| v.to_string())
+        .or_else(|_| env.secret(name).map(|v| v.to_string()))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// JSON response with a status code and no-store caching.
@@ -97,7 +130,9 @@ pub fn redirect(location: &str, status: u16) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Location", &header_safe_url(location))?;
     headers.set("Cache-Control", "private, max-age=0")?;
-    headers.set("Referrer-Policy", "unsafe-url")?;
+    // The browser default: a cross-origin destination sees only the origin of the page
+    // the link was clicked on, not its path or query (same-origin requests keep it).
+    headers.set("Referrer-Policy", "strict-origin-when-cross-origin")?;
     headers.set("X-Robots-Tag", "noindex")?;
     Ok(Response::empty()?.with_status(status).with_headers(headers))
 }

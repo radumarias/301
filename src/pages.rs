@@ -25,10 +25,9 @@ pub fn page(status: u16, title: &str, body: &str) -> Result<Response> {
     let mut res = Response::from_html(html)?.with_status(status);
     let h = res.headers_mut();
     h.set("Cache-Control", "no-store")?;
-    h.set("X-Frame-Options", "DENY")?;
     h.set(
         "Content-Security-Policy",
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     )?;
     Ok(res)
 }
@@ -101,7 +100,36 @@ pub fn landing() -> Result<Response> {
         200,
         "301.xorio.rs",
         "<div class=code>301</div><h1>301.xorio.rs</h1><p>A small, fast link shortener. Shorten a link without an account, or sign in with Google to manage yours.</p>\
-         <a class=btn href=\"/_/\">Shorten a link</a>",
+         <a class=btn href=\"/_/\">Shorten a link</a><p style=\"margin:18px 0 0\"><small><a href=\"/privacy\">Privacy</a></small></p>",
+    )
+}
+
+/// What a visitor's click records, for transparency (GDPR art. 13).
+pub fn privacy(retention_days: u32, contact: &str) -> Result<Response> {
+    let kept = if retention_days == 0 {
+        "Click details are kept until the owner deletes them.".to_string()
+    } else {
+        format!("Click details are deleted automatically after {retention_days} days; only a per-link total count is kept.")
+    };
+    let contact = if contact.is_empty() {
+        String::new()
+    } else {
+        format!("<p>Questions or requests: {}</p>", esc(contact))
+    };
+    page(
+        200,
+        "Privacy",
+        &format!(
+            "<h1>Privacy</h1>\
+             <p>When you open a short link, this service records the time, the link, your approximate location \
+             (country and city, derived by Cloudflare from your IP address), the referring website's host name, \
+             and your device type, operating system and browser family. This is used only for aggregate click \
+             statistics for the link's owner.</p>\
+             <p>Your IP address and full user agent are not stored, visitors following a link get no cookies, and nothing is shared or sold. \
+             {kept}</p>\
+             <p>The service runs on Cloudflare, which processes requests on the owner's behalf and may keep short-lived \
+             operational logs.</p>{contact}"
+        ),
     )
 }
 

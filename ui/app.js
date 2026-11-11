@@ -15,7 +15,6 @@ function h(tag, attrs, ...kids) {
     if (v == null || v === false) continue;
     if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (k === "class") el.className = v;
-    else if (k === "html") el.innerHTML = v; // only used with trusted, generated SVG
     else if (k === "value") el.value = v;
     else if (k === "checked") el.checked = !!v;
     else el.setAttribute(k, v === true ? "" : v);
@@ -700,6 +699,7 @@ async function settingsPage() {
   const red = h("select", {}, [301, 302, 307, 308].map((v) => h("option", { value: v, selected: v === st.default_redirect }, v)));
   const style = h("select", {}, [["random", "Random chars (k7RmQ2x)"], ["words", "Words (brave-otter-42)"], ["names", "Names (curious-lovelace)"]].map(([v, l]) => h("option", { value: v, selected: v === st.default_slug_style }, l)));
   const len = h("input", { type: "number", min: 4, max: 32, value: st.default_slug_length });
+  const keep = h("input", { type: "number", min: 0, max: 3650, step: 1, required: true, value: st.click_retention_days });
   const anonOn = h("input", { type: "checkbox", checked: st.anon_enabled });
   const anonTtl = h("input", { type: "number", min: 1, max: 365, value: st.anon_ttl_days });
   const anonRate = h("input", { type: "number", min: 0, max: 1000, value: st.anon_per_hour });
@@ -709,6 +709,7 @@ async function settingsPage() {
     try {
       await api("PUT", "/settings", {
         root_url: root.value.trim() || null, not_found_url: nf.value.trim() || null, default_redirect: Number(red.value), default_slug_style: style.value, default_slug_length: Number(len.value),
+        click_retention_days: Number(keep.value),
         anon_enabled: anonOn.checked, anon_ttl_days: Number(anonTtl.value), anon_per_hour: Number(anonRate.value), user_per_day: Number(userRate.value),
       });
       toast("Settings saved");
@@ -734,6 +735,7 @@ async function settingsPage() {
       h("form", { class: "panel", onsubmit: save }, h("h2", {}, "Redirects"),
         field("Root URL (301.xorio.rs/)", root), field("Unknown slug redirect", nf),
         field("Default redirect type", red), field("Default slug style", style), field("Random slug length", len),
+        field("Keep click details for (days, 0 = forever)", keep),
         h("h2", { style: "margin-top:22px" }, "Public access"),
         h("label", { class: "check", style: "margin-bottom:12px" }, anonOn, "Anyone can create links without an account"),
         !CFG.turnstile_site_key && !CFG.dev && h("div", { class: "notice" }, "Anonymous links stay off until Turnstile is configured (TURNSTILE_SITE_KEY and TURNSTILE_SECRET)."),

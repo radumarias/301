@@ -19,20 +19,20 @@ use worker::{Env, Method, Request, Response, Result};
 const HOUR_MS: i64 = 3_600_000;
 const REPORTS_PER_HOUR: i64 = 5;
 
-fn anon_available(env: &Env, st: &Settings) -> bool {
-    st.anon_enabled && (safety::turnstile_configured(env) || auth::dev_email(env).is_some())
+fn anon_available(req: &Request, env: &Env, st: &Settings) -> bool {
+    st.anon_enabled && (safety::turnstile_configured(env) || auth::dev_email(req, env).is_some())
 }
 
-pub async fn config(env: &Env) -> Result<Response> {
+pub async fn config(req: &Request, env: &Env) -> Result<Response> {
     // Every page load asks for this: read settings from the edge cache, not D1.
     let st = store::settings_cached(env).await;
     let site_key = auth::var(env, "TURNSTILE_SITE_KEY");
     json(
         &serde_json::json!({
             "google": auth::google_configured(env),
-            "dev": auth::dev_email(env).is_some(),
+            "dev": auth::dev_email(req, env).is_some(),
             "turnstile_site_key": (safety::turnstile_configured(env)).then_some(site_key),
-            "anon": { "enabled": anon_available(env, &st), "ttl_days": st.anon_ttl_days },
+            "anon": { "enabled": anon_available(req, env, &st), "ttl_days": st.anon_ttl_days },
         }),
         200,
     )
@@ -49,7 +49,7 @@ struct Create {
 
 pub async fn create(mut req: Request, env: &Env) -> Result<Response> {
     let st = store::settings(env).await.unwrap_or_default();
-    if !anon_available(env, &st) {
+    if !anon_available(&req, env, &st) {
         return json_error(
             "Creating links without an account is turned off. Sign in to create links.",
             403,

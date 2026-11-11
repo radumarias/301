@@ -6,6 +6,7 @@
 
 use crate::account;
 use crate::crypto::{b64url_decode, verify_rs256};
+pub use crate::util::env_var as var;
 use crate::util::now_ms;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -64,19 +65,27 @@ pub struct Claims {
     common_name: Option<String>,
 }
 
-thread_local! {
-    /// JWKS by certs URL: (fetched at ms, keys).
-    static JWKS: RefCell<HashMap<String, (i64, Vec<serde_json::Value>)>> = RefCell::new(HashMap::new());
+#[derive(Default)]
+struct JwksEntry {
+    /// When the keys were fetched (ms) and the keys; empty until the first success.
+    fetched_at: i64,
+    keys: Vec<serde_json::Value>,
+    /// When this isolate last started a fetch of this URL (successful or not).
+    attempt: i64,
+    /// True while a fetch is in flight; concurrent requests wait for it.
+    fetching: bool,
 }
 
-pub fn var(env: &Env, name: &str) -> String {
-    env.var(name)
-        .map(|v| v.to_string())
-        .or_else(|_| env.secret(name).map(|v| v.to_string()))
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+thread_local! {
+    /// JWKS by certs URL (Access certs, Google certs).
+    static JWKS: RefCell<HashMap<String, JwksEntry>> = RefCell::new(HashMap::new());
 }
+
+const JWKS_TTL_MS: i64 = 3_600_000;
+/// An unknown `kid` or a failed signature (key rotation) refetches early, but fetch
+/// attempts, successful or not, start at most this often per isolate and URL, so forged
+/// tokens cannot turn requests into fetches of the certs.
+const JWKS_MIN_REFRESH_MS: i64 = 60_000;
 
 pub fn list(v: &str) -> Vec<String> {
     v.split(',')
@@ -97,11 +106,17 @@ fn access_configured(env: &Env) -> bool {
     !var(env, "ACCESS_TEAM_DOMAIN").is_empty() && !var(env, "ACCESS_AUD").is_empty()
 }
 
+fn is_local(req: &Request) -> bool {
+    req.url()
+        .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+}
+
 /// Local development only (`.dev.vars`): ignored as soon as Access or Google is configured,
-/// so it can never open a deployed Worker.
-pub fn dev_email(env: &Env) -> Option<String> {
+/// and only honoured on a loopback host, so it can never open a deployed Worker.
+pub fn dev_email(req: &Request, env: &Env) -> Option<String> {
     let dev = var(env, "DEV_AUTH_EMAIL");
-    (!dev.is_empty() && !access_configured(env) && !google_configured(env)).then_some(dev)
+    (!dev.is_empty() && !access_configured(env) && !google_configured(env) && is_local(req))
+        .then_some(dev)
 }
 
 fn access_token(req: &Request) -> Option<String> {
@@ -111,28 +126,67 @@ fn access_token(req: &Request) -> Option<String> {
     account::cookie(req, "CF_Authorization")
 }
 
-async fn jwks(url: &str) -> worker::Result<Vec<serde_json::Value>> {
-    let now = now_ms();
-    let cached = JWKS.with(|c| {
-        c.borrow()
-            .get(url)
-            .filter(|(at, _)| now - at < 3_600_000)
-            .map(|(_, k)| k.clone())
-    });
-    if let Some(k) = cached {
+fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
+    kid.is_none_or(|kid| {
+        keys.iter()
+            .any(|k| k.get("kid").and_then(|v| v.as_str()) == Some(kid))
+    })
+}
+
+fn with_entry<R>(url: &str, f: impl FnOnce(&mut JwksEntry) -> R) -> R {
+    JWKS.with(|c| f(c.borrow_mut().entry(url.to_string()).or_default()))
+}
+
+async fn jwks(url: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
+    let fresh = |e: &JwksEntry, now: i64| {
+        !e.keys.is_empty() && now - e.fetched_at < JWKS_TTL_MS && has_kid(&e.keys, kid)
+    };
+    // Fresh keys that know this `kid` need no fetch, even while one is in flight.
+    let start = now_ms();
+    if let Some(k) = with_entry(url, |e| fresh(e, start).then(|| e.keys.clone())) {
         return Ok(k);
     }
+    // Another request in this isolate is fetching: wait for its result instead of
+    // failing or starting a second fetch (the UI sends requests in parallel).
+    let mut waited = 0;
+    while with_entry(url, |e| e.fetching) && waited < 10_000 {
+        worker::Delay::from(std::time::Duration::from_millis(25)).await;
+        waited += 25;
+    }
+    let now = now_ms();
+    let recent_attempt = with_entry(url, |e| now - e.attempt < JWKS_MIN_REFRESH_MS);
+    if let Some(k) = with_entry(url, |e| {
+        (!e.keys.is_empty() && (recent_attempt || fresh(e, now))).then(|| e.keys.clone())
+    }) {
+        return Ok(k);
+    }
+    if recent_attempt {
+        return Err(worker::Error::RustError(
+            "certs fetch failed recently; retrying shortly".into(),
+        ));
+    }
+    // Recorded before awaiting, so concurrent requests and failed fetches count too.
+    with_entry(url, |e| {
+        e.attempt = now;
+        e.fetching = true;
+    });
+    let res = fetch_jwks(url).await;
+    with_entry(url, |e| e.fetching = false);
+    let keys = res?;
+    with_entry(url, |e| {
+        e.fetched_at = now;
+        e.keys = keys.clone();
+    });
+    Ok(keys)
+}
+
+async fn fetch_jwks(url: &str) -> worker::Result<Vec<serde_json::Value>> {
     #[derive(Deserialize)]
     struct Jwks {
         keys: Vec<serde_json::Value>,
     }
     let mut res = Fetch::Url(url.parse()?).send().await?;
-    let body: Jwks = res.json().await?;
-    JWKS.with(|c| {
-        c.borrow_mut()
-            .insert(url.to_string(), (now, body.keys.clone()))
-    });
-    Ok(body.keys)
+    Ok(res.json::<Jwks>().await?.keys)
 }
 
 /// Verifies an RS256 JWT against the JWKS at `certs_url` and returns its claims.
@@ -154,7 +208,7 @@ pub async fn verify_jwt<T: DeserializeOwned>(token: &str, certs_url: &str) -> Re
     let sig =
         b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
 
-    let keys = jwks(certs_url)
+    let keys = jwks(certs_url, header.kid.as_deref())
         .await
         .map_err(|e| AuthError::Denied(format!("could not fetch signing keys: {e}")))?;
     let candidates: Vec<&serde_json::Value> = keys
@@ -173,8 +227,9 @@ pub async fn verify_jwt<T: DeserializeOwned>(token: &str, certs_url: &str) -> Re
             return Ok(claims);
         }
     }
-    // Keys may have rotated: drop the cache so the next request refetches.
-    JWKS.with(|c| c.borrow_mut().remove(certs_url));
+    // Keys may have rotated under a token without a `kid`: expire the cache so the next
+    // request refetches (still subject to the attempt limit in `jwks`).
+    with_entry(certs_url, |e| e.fetched_at = 0);
     Err(AuthError::Denied("invalid token signature".into()))
 }
 
@@ -274,7 +329,7 @@ pub async fn identify(req: &Request, env: &Env) -> Result<Option<Identity>, Auth
             }));
         }
     }
-    if let Some(dev) = dev_email(env) {
+    if let Some(dev) = dev_email(req, env) {
         return identity_for_email(env, dev, true).await.map(Some);
     }
     if access_configured(env) {

@@ -24,7 +24,16 @@ mod redirect;
 pub mod safety;
 mod ui;
 
-use worker::{event, Context, Env, Request, Response, Result};
+use worker::{event, Context, Env, Request, Response, Result, ScheduleContext, ScheduledEvent};
+
+/// Hourly cron (see `[triggers]` in wrangler.toml): enforces click retention.
+#[event(scheduled)]
+async fn scheduled(_ev: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    match store::purge_old_clicks(&env).await {
+        Ok(n) => worker::console_log!("click retention: deleted {n} old click events"),
+        Err(e) => worker::console_error!("click retention failed: {e}"),
+    }
+}
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -41,8 +50,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     } else {
         redirect::handle(req, env, ctx).await
     };
-    res.or_else(|e| {
+    let mut res = res.or_else(|e| {
         worker::console_error!("unhandled: {e}");
         Response::error("Internal error", 500)
-    })
+    })?;
+    util::harden(&mut res)?;
+    Ok(res)
 }

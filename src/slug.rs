@@ -213,6 +213,7 @@ const RESERVED: &[&str] = &[
     "_",
     "api",
     "auth",
+    "privacy",
     "robots.txt",
     "favicon.ico",
     "favicon.svg",

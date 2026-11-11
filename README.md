@@ -51,7 +51,8 @@ scripts/provision.sh   creates KV and D1 idempotently (and the Access app, unles
    **Account → D1: Edit**, **Account → Access: Apps and Policies: Edit**,
    **Account → Access: Organizations, Identity Providers, and Groups: Read**, plus **Zone (xorio.rs) → DNS: Edit** only if you use a custom domain.
 2. In the GitHub repo, add **secrets** `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, and optionally
-   **variables** `ADMIN_EMAILS` (defaults to the token owner's email) and `ACCESS_TEAM_DOMAIN`.
+   the **secret** `ADMIN_EMAILS` (defaults to the token owner's email; a secret so it stays out of public CI logs)
+   and the **variable** `ACCESS_TEAM_DOMAIN`.
 3. If you have never opened Zero Trust, visit [one.dash.cloudflare.com](https://one.dash.cloudflare.com) once to pick a team name.
 4. Push to `main`. The workflow tests, provisions KV / D1 / Access, applies migrations and deploys to `xorio-301.<your-subdomain>.workers.dev` (set the `DOMAIN` variable and the route in `wrangler.toml` to use a custom domain such as 301.xorio.rs).
 
@@ -66,7 +67,7 @@ Until `GOOGLE_CLIENT_ID` is set, the app stays admin-only behind Cloudflare Acce
 2. **Turnstile.** In the Cloudflare dashboard, **Turnstile → Add widget**, hostname = your host, mode Managed.
 3. **Safe Browsing (optional, recommended).** In the same Google Cloud project enable the **Safe Browsing API** and create an API key.
 4. In the GitHub repo add **variables** `GOOGLE_CLIENT_ID`, `TURNSTILE_SITE_KEY` and **secrets** `GOOGLE_CLIENT_SECRET`,
-   `TURNSTILE_SECRET`, `SAFE_BROWSING_KEY`. Make sure the `ADMIN_EMAILS` variable holds the Google address you sign in with.
+   `TURNSTILE_SECRET`, `SAFE_BROWSING_KEY`, `ADMIN_EMAILS`. Make sure `ADMIN_EMAILS` holds the Google address you sign in with.
 5. Re-run the deploy. The provision step deletes the "301 admin" Access application (the app has to be public now),
    the secrets are uploaded, and the first admin to sign in becomes the owner of every link made before accounts existed.
    Access service tokens (`ADMIN_SERVICE_TOKENS`) stop working at that point, since Access is gone.
