@@ -89,9 +89,11 @@ pub fn harden(res: &mut Response) -> Result<()> {
 }
 
 /// A trimmed environment variable, empty when unset.
+/// A Worker variable or, failing that, a secret of that name (trimmed, empty if unset).
 pub fn env_var(env: &worker::Env, name: &str) -> String {
     env.var(name)
         .map(|v| v.to_string())
+        .or_else(|_| env.secret(name).map(|v| v.to_string()))
         .unwrap_or_default()
         .trim()
         .to_string()

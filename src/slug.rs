@@ -212,6 +212,7 @@ pub fn generate(style: Style, length: usize, attempt: usize) -> String {
 const RESERVED: &[&str] = &[
     "_",
     "api",
+    "auth",
     "privacy",
     "robots.txt",
     "favicon.ico",
@@ -238,7 +239,11 @@ pub fn validate(slug: &str) -> Result<(), String> {
     if slug.starts_with('/') || slug.ends_with('/') || slug.contains("//") || slug.contains("..") {
         return Err("slug may not start or end with '/', or contain '//' or '..'".into());
     }
-    if RESERVED.contains(&slug) || slug.starts_with("_/") || slug.starts_with("api/") {
+    if RESERVED.contains(&slug)
+        || slug.starts_with("_/")
+        || slug.starts_with("api/")
+        || slug.starts_with("auth/")
+    {
         return Err("slug is reserved".into());
     }
     Ok(())
@@ -257,6 +262,7 @@ mod tests {
         assert!(validate("api").is_err());
         assert!(validate("api/x").is_err());
         assert!(validate("_/x").is_err());
+        assert!(validate("auth/login").is_err());
         assert!(validate("a b").is_err());
         assert!(validate("/a").is_err());
         assert!(validate("a//b").is_err());

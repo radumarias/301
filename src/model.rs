@@ -93,7 +93,23 @@ pub struct Link {
     pub updated_at: i64,
     #[serde(default)]
     pub aliases: Vec<String>,
-    /// `active`, `disabled` or `expired`, computed when read.
+    /// The account that owns the link (None: anonymous, or created before accounts).
+    #[serde(default)]
+    pub owner_id: Option<i64>,
+    /// Owner's email, filled when listing for an admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
+    /// Created without an account; managed with a secret token (derived from `manage_hash`).
+    #[serde(default, skip_deserializing)]
+    pub anonymous: bool,
+    #[serde(skip)]
+    pub manage_hash: Option<String>,
+    #[serde(skip)]
+    pub creator_ip: Option<String>,
+    /// Blocked by an admin (the owner cannot re-enable it).
+    #[serde(default)]
+    pub blocked: bool,
+    /// `active`, `disabled`, `blocked` or `expired`, computed when read.
     #[serde(default, skip_deserializing)]
     pub status: &'static str,
 }
@@ -111,12 +127,29 @@ impl Link {
 
     pub fn with_status(mut self) -> Self {
         self.status = self.status(crate::util::now_ms());
+        self.anonymous = self.manage_hash.is_some();
         self
+    }
+
+    /// Every URL the link can send visitors to (default, fallback, geo and device rules).
+    pub fn destinations(&self) -> Vec<&str> {
+        std::iter::once(self.url.as_str())
+            .chain(self.fallback_url.as_deref())
+            .chain(self.geo.values().map(String::as_str))
+            .chain(
+                [&self.device.ios, &self.device.android, &self.device.desktop]
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+            .collect()
     }
 
     /// Whether visitors can currently follow the link.
     pub fn status(&self, now: i64) -> &'static str {
-        if self.disabled {
+        if self.blocked {
+            "blocked"
+        } else if self.disabled {
             "disabled"
         } else if self.expires_at.is_some_and(|e| now >= e)
             || self.max_clicks.is_some_and(|m| self.clicks >= m)
@@ -152,6 +185,16 @@ pub struct LinkRow {
     pub last_click_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub owner_id: Option<i64>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub manage_hash: Option<String>,
+    #[serde(default)]
+    pub creator_ip: Option<String>,
+    #[serde(default)]
+    pub blocked: Option<i64>,
 }
 
 fn parse_json<T: for<'a> Deserialize<'a> + Default>(s: &Option<String>) -> T {
@@ -186,6 +229,12 @@ impl From<LinkRow> for Link {
             created_at: r.created_at,
             updated_at: r.updated_at,
             aliases: vec![],
+            owner_id: r.owner_id,
+            owner_email: r.owner_email,
+            anonymous: false,
+            manage_hash: r.manage_hash,
+            creator_ip: r.creator_ip,
+            blocked: r.blocked.unwrap_or(0) != 0,
             status: "",
         }
         .with_status()
@@ -233,6 +282,9 @@ pub struct LinkInput {
     pub add_tags: Option<Vec<String>>,
     #[serde(default)]
     pub remove_tags: Option<Vec<String>>,
+    /// Admin-only (bulk block/unblock); never read from a request body.
+    #[serde(skip_deserializing)]
+    pub blocked: Option<bool>,
 }
 
 pub fn clean(s: Option<String>) -> Option<String> {
@@ -342,26 +394,21 @@ impl LinkInput {
         if let Some(s) = &self.source {
             link.source = s.clone();
         }
+        if let Some(b) = self.blocked {
+            link.blocked = b;
+        }
         validate_link(link)
     }
 }
 
 pub fn validate_link(link: &Link) -> Result<(), String> {
-    validate_url(&link.url)?;
     validate_redirect_type(link.redirect_type)?;
-    if let Some(f) = &link.fallback_url {
-        validate_url(f)?;
-    }
-    for (cc, u) in &link.geo {
+    for cc in link.geo.keys() {
         if cc.len() != 2 || !cc.chars().all(|c| c.is_ascii_uppercase()) {
             return Err(format!("geo key must be a 2-letter country code: {cc}"));
         }
-        validate_url(u)?;
     }
-    for u in [&link.device.ios, &link.device.android, &link.device.desktop]
-        .into_iter()
-        .flatten()
-    {
+    for u in link.destinations() {
         validate_url(u)?;
     }
     if link.title.as_ref().is_some_and(|t| t.len() > 512) {
@@ -456,6 +503,8 @@ pub struct KvRecord {
     pub device: Device,
     #[serde(default)]
     pub passthrough: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
 }
 
 impl KvRecord {
@@ -476,6 +525,7 @@ impl KvRecord {
                 .collect(),
             device: l.device.map(|u| apply_utm(u, &l.utm)),
             passthrough: l.passthrough,
+            blocked: l.blocked,
         }
     }
 
@@ -551,6 +601,7 @@ mod tests {
                 ..Default::default()
             },
             passthrough: false,
+            blocked: false,
         };
         assert_eq!(r.destination("iOS", "mobile", Some("RO")), "https://ios");
         assert_eq!(r.destination("Android", "mobile", Some("RO")), "https://ro");

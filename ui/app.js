@@ -1,8 +1,12 @@
-// 301.xorio.rs admin. Vanilla JS, no build step. CSP: script-src 'self' (no inline handlers).
+// 301.xorio.rs web app. Vanilla JS, no build step. CSP: script-src 'self' (no inline handlers).
+// Signed out: anonymous shortener. Signed in: your links. Admins also get import and moderation.
 "use strict";
 
 const ORIGIN = location.origin;
 const $app = document.getElementById("app");
+let ME = null; // { email, name, admin, user_id } once signed in
+let CFG = { google: false, anon: { enabled: false, ttl_days: 30 } };
+const isAdmin = () => !!(ME && ME.admin);
 
 // ---------- tiny DOM helper ----------
 function h(tag, attrs, ...kids) {
@@ -47,7 +51,11 @@ async function api(method, path, body) {
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -79,19 +87,24 @@ const toLocalInput = (ms) => {
 const fromLocalInput = (v) => (v ? new Date(v).getTime() : null);
 
 // ---------- router ----------
+// [pattern, page, nav item, public?]
 const routes = [
+  [/^#\/m\/([A-Za-z0-9_-]+)$/, (m) => managePage(m[1]), "", true],
+  [/^#\/report\/(.+)$/, (m) => reportPage(decodeURIComponent(m[1])), "", true],
   [/^#?\/?$/, dashboard, "dash"],
   [/^#\/links\/?$/, linksPage, "links"],
   [/^#\/links\/new$/, (m) => editPage(null), "links"],
   [/^#\/links\/(\d+)$/, (m) => editPage(Number(m[1])), "links"],
   [/^#\/import$/, importPage, "import"],
+  [/^#\/moderation$/, moderationPage, "moderation"],
   [/^#\/settings$/, settingsPage, "settings"],
 ];
 async function render() {
   const hash = location.hash || "#/";
-  for (const [re, fn, nav] of routes) {
+  for (let [re, fn, nav, pub] of routes) {
     const m = hash.match(re);
     if (m) {
+      if (!ME && !pub) fn = publicHome;
       document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav));
       $app.replaceChildren(h("p", { class: "muted" }, "Loading…"));
       try { await fn(m); } catch (e) { $app.replaceChildren(h("div", { class: "panel" }, h("h2", {}, "Something went wrong"), h("p", { class: "bad" }, e.message))); }
@@ -104,14 +117,14 @@ async function render() {
 window.addEventListener("hashchange", render);
 document.getElementById("new-link").addEventListener("click", () => (location.hash = "#/links/new"));
 document.addEventListener("keydown", (e) => {
-  if (e.key === "n" && !e.metaKey && !e.ctrlKey && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) {
+  if (ME && e.key === "n" && !e.metaKey && !e.ctrlKey && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) {
     e.preventDefault();
     location.hash = "#/links/new";
   }
 });
 // Paste a URL anywhere (outside inputs) to start a new link with it.
 document.addEventListener("paste", (e) => {
-  if (["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
+  if (!ME || ["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
   const text = (e.clipboardData.getData("text") || "").trim();
   if (/^https?:\/\/\S+$/i.test(text)) {
     sessionStorage.setItem("prefill-url", text);
@@ -177,7 +190,7 @@ async function dashboard() {
   const pick = (r) => { sessionStorage.setItem("range", r); render(); };
   const [chart, dims] = statsBlock(st);
   $app.replaceChildren(
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Dashboard"), h("div", { class: "muted" }, "Human clicks; bots and link previews are counted separately.")), rangePicker(range, pick)),
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, isAdmin() ? "Dashboard" : "Your links"), h("div", { class: "muted" }, "Human clicks; bots and link previews are counted separately.")), rangePicker(range, pick)),
     h("div", { class: "grid g4", style: "margin-bottom:16px" },
       stat("Clicks", st.clicks), stat("Links", st.links), stat("QR scans", st.qr), stat("Bot hits", st.bots)),
     h("div", { class: "grid", style: "gap:16px" },
@@ -193,9 +206,9 @@ async function dashboard() {
 const stat = (l, v) => h("div", { class: "panel stat" }, h("div", { class: "v" }, fmt.n(v)), h("div", { class: "l" }, l));
 
 // ---------- links list ----------
-const listState = { q: "", tag: "", sort: "created", order: "desc", status: "", offset: 0, limit: 50, selected: new Set() };
+const listState = { q: "", tag: "", sort: "created", order: "desc", status: "", owner: "", offset: 0, limit: 50, selected: new Set() };
 async function linksPage() {
-  const qs = new URLSearchParams({ q: listState.q, tag: listState.tag, sort: listState.sort, order: listState.order, status: listState.status, offset: listState.offset, limit: listState.limit });
+  const qs = new URLSearchParams({ q: listState.q, tag: listState.tag, sort: listState.sort, order: listState.order, status: listState.status, owner: listState.owner, offset: listState.offset, limit: listState.limit });
   const [page, tags] = await Promise.all([api("GET", `/links?${qs}`), api("GET", "/tags")]);
   const search = h("input", { type: "search", placeholder: "Search slug, URL, title, notes", value: listState.q });
   let timer;
@@ -204,7 +217,10 @@ async function linksPage() {
   const tagSel = h("select", { onchange: setFilter("tag") },
     h("option", { value: "" }, "All tags"), tags.map((t) => h("option", { value: t.tag, selected: t.tag === listState.tag }, `${t.tag} (${t.n})`)));
   const statusSel = h("select", { onchange: setFilter("status") },
-    [["", "Any status"], ["active", "Active"], ["disabled", "Disabled"], ["expired", "Expired"], ["protected", "Password"]].map(([v, l]) => h("option", { value: v, selected: v === listState.status }, l)));
+    [["", "Any status"], ["active", "Active"], ["disabled", "Disabled"], ["expired", "Expired"], ["protected", "Password"], ["blocked", "Blocked"], ...(isAdmin() ? [["reported", "Reported"]] : [])].map(([v, l]) => h("option", { value: v, selected: v === listState.status }, l)));
+  const ownerOpts = [["", "Everyone's links"], ["me", "My links"], ["anon", "Anonymous"]];
+  if (listState.owner && !ownerOpts.some(([v]) => v === listState.owner)) ownerOpts.push([listState.owner, `User #${listState.owner}`]);
+  const ownerSel = isAdmin() && h("select", { onchange: setFilter("owner") }, ownerOpts.map(([v, l]) => h("option", { value: v, selected: v === listState.owner }, l)));
   const sortSel = h("select", { onchange: (e) => { const [s1, o] = e.target.value.split(":"); listState.sort = s1; listState.order = o; linksPage(); } },
     [["created:desc", "Newest"], ["created:asc", "Oldest"], ["clicks:desc", "Most clicks"], ["last_click:desc", "Recently clicked"], ["slug:asc", "Slug A→Z"]].map(([v, l]) =>
       h("option", { value: v, selected: v === `${listState.sort}:${listState.order}` }, l)));
@@ -216,6 +232,8 @@ async function linksPage() {
     h("button", { class: "btn sm", onclick: () => bulk("untag") }, "Remove tag"),
     h("button", { class: "btn sm", onclick: () => bulk("disable") }, "Disable"),
     h("button", { class: "btn sm", onclick: () => bulk("enable") }, "Enable"),
+    isAdmin() && h("button", { class: "btn sm", onclick: () => bulk("block"), title: "Owners cannot re-enable a blocked link" }, "Block"),
+    isAdmin() && h("button", { class: "btn sm", onclick: () => bulk("unblock") }, "Unblock"),
     h("button", { class: "btn sm danger", onclick: () => bulk("delete") }, "Delete"));
   const syncBar = () => { bulkBar.style.display = sel.size ? "" : "none"; selCount.textContent = `${sel.size} selected`; };
   syncBar();
@@ -240,9 +258,12 @@ async function linksPage() {
       h("td", {},
         h("div", {}, h("span", { class: "slug" }, "/" + l.slug),
           l.status === "disabled" && h("span", { class: "badge off" }, "OFF"),
+          l.blocked && h("span", { class: "badge blocked" }, "BLOCKED"),
+          l.anonymous && h("span", { class: "badge anon" }, "ANON"),
           l.has_password && h("span", { class: "badge lock" }, "PW"),
           l.status === "expired" && h("span", { class: "badge exp" }, "EXPIRED")),
         h("div", { class: "dest" }, l.title ? `${l.title} · ${l.url}` : l.url),
+        isAdmin() && l.owner_id !== ME.user_id && h("div", { class: "small muted" }, l.owner_email ? `by ${l.owner_email}` : l.anonymous ? "anonymous" : ""),
         h("div", {}, l.tags.map((t) => h("span", { class: "tag" }, t)))),
       h("td", { class: "num" }, fmt.n(l.clicks), h("div", { class: "muted small" }, fmt.ago(l.last_click_at))),
       h("td", { class: "small muted" }, fmt.date(l.created_at)),
@@ -258,10 +279,10 @@ async function linksPage() {
   $app.replaceChildren(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Links"), h("div", { class: "muted" }, `${fmt.n(page.total)} links · press `, h("span", { class: "kbd" }, "n"), " for a new one, or paste a URL anywhere")), bulkBar),
     h("div", { class: "panel" },
-      h("div", { class: "grid", style: "grid-template-columns: 2fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 8px" }, search, tagSel, statusSel, sortSel),
+      h("div", { class: "grid", style: `grid-template-columns: 2fr ${ownerSel ? "1fr " : ""}1fr 1fr 1fr; gap: 8px; margin-bottom: 8px` }, search, ownerSel, tagSel, statusSel, sortSel),
       page.items.length ? h("div", { class: "table-wrap" }, h("table", {},
         h("thead", {}, h("tr", {}, h("th", {}, allBox), h("th", {}, "Link"), h("th", { class: "num" }, "Clicks"), h("th", {}, "Created"), h("th", {}))),
-        h("tbody", {}, rows))) : h("div", { class: "empty" }, listState.q || listState.tag || listState.status ? "No links match." : "No links yet. Create one or import from another service."),
+        h("tbody", {}, rows))) : h("div", { class: "empty" }, listState.q || listState.tag || listState.status || listState.owner ? "No links match." : isAdmin() ? "No links yet. Create one or import from another service." : "No links yet. Create your first one."),
       h("div", { class: "pager" },
         h("button", { class: "btn sm", disabled: listState.offset === 0, onclick: () => { listState.offset = Math.max(0, listState.offset - listState.limit); linksPage(); } }, "← Prev"),
         h("span", { class: "muted small" }, page.total ? `${listState.offset + 1}–${Math.min(page.total, listState.offset + listState.limit)} of ${fmt.n(page.total)}` : ""),
@@ -339,7 +360,11 @@ async function editPage(id) {
   for (const k of ["ios", "android", "desktop"]) dev[k] = h("input", { type: "url", value: (L.device || {})[k] || "", placeholder: { ios: "https://apps.apple.com/app/…", android: "https://play.google.com/store/apps/details?id=…", desktop: "https://example.com/desktop" }[k] });
 
   const hasAdvanced = (o) => Object.values(o || {}).some(Boolean);
+  const notice = L.blocked
+    ? h("div", { class: "notice" }, isAdmin() ? "Blocked by an admin: visitors get a 410 page and the owner cannot edit it. Unblock it from the Links list." : "An admin blocked this link because it broke the rules of this service. It cannot be edited.")
+    : null;
   const form = h("form", { class: "panel", onsubmit: save },
+    notice,
     field("Destination URL", f.url),
     h("div", { class: "field" }, h("label", {}, "Short link"),
       h("div", { class: "row slug-row" }, h("span", { class: "muted mono small", style: "white-space:nowrap" }, ORIGIN.replace(/^https?:\/\//, "") + "/"), f.slug, styleSel, genBtn), slugStatus),
@@ -429,7 +454,8 @@ async function editPage(id) {
   }
   $app.replaceChildren(
     h("div", { class: "page-head" },
-      h("div", {}, h("div", { class: "shorturl" }, shortUrl(L.slug)), h("div", { class: "muted small" }, `Created ${fmt.dt(L.created_at)} · source: ${L.source} · last click ${fmt.ago(L.last_click_at)}`)),
+      h("div", {}, h("div", { class: "shorturl" }, shortUrl(L.slug)), h("div", { class: "muted small" }, `Created ${fmt.dt(L.created_at)} · source: ${L.source} · last click ${fmt.ago(L.last_click_at)}`,
+        isAdmin() && L.owner_id !== ME.user_id ? ` · owner: ${L.owner_email || (L.anonymous ? "anonymous" : "none")}` : "")),
       h("div", { class: "row" }, h("button", { class: "btn primary", onclick: () => copy(shortUrl(L.slug)) }, "Copy"), h("a", { class: "btn", href: shortUrl(L.slug) + "+", target: "_blank", rel: "noopener" }, "Preview"))),
     h("div", { class: "grid side" }, form, h("div", { class: "grid" }, qr, aliasPanel)),
     statsWrap);
@@ -654,18 +680,38 @@ async function importPage() {
 // ---------- settings ----------
 async function settingsPage() {
   const st = await api("GET", "/settings");
+  const theme = h("select", {}, [["", "System"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => h("option", { value: v, selected: v === (localStorage.getItem("theme") || "") }, l)));
+  theme.addEventListener("change", () => { try { localStorage.setItem("theme", theme.value); } catch {} applyTheme(); });
+  const exportPanel = h("div", { class: "panel" }, h("h2", {}, "Export"), h("p", { class: "muted small" }, isAdmin() ? "All links with their settings and click counts." : "Your links with their settings and click counts."),
+    h("div", { class: "row" }, h("a", { class: "btn", href: "/api/export?format=csv" }, "Download CSV"), h("a", { class: "btn", href: "/api/export?format=json" }, "Download JSON")));
+  const appearance = h("div", { class: "panel" }, h("h2", {}, "Appearance"), field("Theme", theme));
+  const accountPanel = h("div", { class: "panel" }, h("h2", {}, "Account"),
+    h("p", { class: "small" }, ME.name ? `${ME.name} · ${ME.email}` : ME.email),
+    h("p", { class: "muted small" }, isAdmin() ? "You are an admin." : `You can create up to ${st.user_per_day} links a day.`),
+    h("button", { class: "btn", onclick: signOut }, "Sign out"));
+  if (!isAdmin()) {
+    $app.replaceChildren(h("div", { class: "page-head" }, h("h1", {}, "Settings")), h("div", { class: "grid g2" }, accountPanel, h("div", { class: "grid" }, exportPanel, appearance)));
+    return;
+  }
+
   const root = h("input", { type: "url", value: st.root_url || "", placeholder: "Empty: a small landing page" });
   const nf = h("input", { type: "url", value: st.not_found_url || "", placeholder: "Empty: a 404 page" });
   const red = h("select", {}, [301, 302, 307, 308].map((v) => h("option", { value: v, selected: v === st.default_redirect }, v)));
   const style = h("select", {}, [["random", "Random chars (k7RmQ2x)"], ["words", "Words (brave-otter-42)"], ["names", "Names (curious-lovelace)"]].map(([v, l]) => h("option", { value: v, selected: v === st.default_slug_style }, l)));
   const len = h("input", { type: "number", min: 4, max: 32, value: st.default_slug_length });
   const keep = h("input", { type: "number", min: 0, max: 3650, step: 1, required: true, value: st.click_retention_days });
-  const theme = h("select", {}, [["", "System"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => h("option", { value: v, selected: v === (localStorage.getItem("theme") || "") }, l)));
-  theme.addEventListener("change", () => { try { localStorage.setItem("theme", theme.value); } catch {} applyTheme(); });
+  const anonOn = h("input", { type: "checkbox", checked: st.anon_enabled });
+  const anonTtl = h("input", { type: "number", min: 1, max: 365, value: st.anon_ttl_days });
+  const anonRate = h("input", { type: "number", min: 0, max: 1000, value: st.anon_per_hour });
+  const userRate = h("input", { type: "number", min: 0, max: 10000, value: st.user_per_day });
   async function save(e) {
     e.preventDefault();
     try {
-      await api("PUT", "/settings", { root_url: root.value.trim() || null, not_found_url: nf.value.trim() || null, default_redirect: Number(red.value), default_slug_style: style.value, default_slug_length: Number(len.value), click_retention_days: Number(keep.value) });
+      await api("PUT", "/settings", {
+        root_url: root.value.trim() || null, not_found_url: nf.value.trim() || null, default_redirect: Number(red.value), default_slug_style: style.value, default_slug_length: Number(len.value),
+        click_retention_days: Number(keep.value),
+        anon_enabled: anonOn.checked, anon_ttl_days: Number(anonTtl.value), anon_per_hour: Number(anonRate.value), user_per_day: Number(userRate.value),
+      });
       toast("Settings saved");
     } catch (err) { toast(err.message, true); }
   }
@@ -690,13 +736,240 @@ async function settingsPage() {
         field("Root URL (301.xorio.rs/)", root), field("Unknown slug redirect", nf),
         field("Default redirect type", red), field("Default slug style", style), field("Random slug length", len),
         field("Keep click details for (days, 0 = forever)", keep),
+        h("h2", { style: "margin-top:22px" }, "Public access"),
+        h("label", { class: "check", style: "margin-bottom:12px" }, anonOn, "Anyone can create links without an account"),
+        !CFG.turnstile_site_key && !CFG.dev && h("div", { class: "notice" }, "Anonymous links stay off until Turnstile is configured (TURNSTILE_SITE_KEY and TURNSTILE_SECRET)."),
+        h("div", { class: "grid g2" }, field("Anonymous links expire after (days)", anonTtl), field("Anonymous links per IP per hour", anonRate)),
+        field("Links per signed-in user per day", userRate, "Admins have no limit."),
         h("button", { class: "btn primary", type: "submit" }, "Save")),
-      h("div", { class: "grid" },
-        h("div", { class: "panel" }, h("h2", {}, "Export"), h("p", { class: "muted small" }, "All links with their settings and click counts."),
-          h("div", { class: "row" }, h("a", { class: "btn", href: "/api/export?format=csv" }, "Download CSV"), h("a", { class: "btn", href: "/api/export?format=json" }, "Download JSON"))),
+      h("div", { class: "grid" }, accountPanel, exportPanel,
         h("div", { class: "panel" }, h("h2", {}, "Maintenance"), h("p", { class: "muted small" }, "Rewrites every link's edge record from the database. Only needed after manual database edits."), rebuildBtn),
-        h("div", { class: "panel" }, h("h2", {}, "Appearance"), field("Theme", theme)))),
+        appearance)),
   );
+}
+
+// ---------- moderation (admins) ----------
+async function moderationPage() {
+  const [reports, users] = await Promise.all([api("GET", "/reports"), api("GET", "/users")]);
+  async function block(r) {
+    try { await api("POST", "/links/bulk", { ids: [r.link_id], action: "block" }); await api("POST", `/reports/${r.id}/resolve?all=1`); toast(`Blocked /${r.slug}`); moderationPage(); }
+    catch (e) { toast(e.message, true); }
+  }
+  async function dismiss(r) {
+    try { await api("POST", `/reports/${r.id}/resolve`); moderationPage(); } catch (e) { toast(e.message, true); }
+  }
+  async function ban(u, banned) {
+    if (banned && !confirm(`Ban ${u.email}? They are signed out and cannot sign in again. Their links keep working until you block them.`)) return;
+    try { await api("POST", `/users/${u.id}`, { banned }); toast(banned ? "Banned" : "Unbanned"); moderationPage(); } catch (e) { toast(e.message, true); }
+  }
+  const viewLinks = (owner) => { Object.assign(listState, { owner: String(owner), offset: 0, status: "", q: "", tag: "" }); location.hash = "#/links"; };
+  $app.replaceChildren(
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Moderation"), h("div", { class: "muted" }, "Reports from visitors, and everyone who has signed in."))),
+    h("div", { class: "panel", style: "margin-bottom:16px" }, h("h2", {}, `Open reports (${reports.length})`),
+      reports.length ? h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Link"), h("th", {}, "Reason"), h("th", {}, "Reported"), h("th", {}))),
+        h("tbody", {}, reports.map((r) => h("tr", {},
+          h("td", {}, r.slug ? h("a", { class: "slug", href: `#/links/${r.link_id}` }, "/" + r.slug) : h("span", { class: "muted" }, "(deleted)"),
+            r.blocked ? h("span", { class: "badge blocked" }, "BLOCKED") : null,
+            h("div", { class: "dest" }, r.url || ""), h("div", { class: "small muted" }, r.owner_email || "anonymous")),
+          h("td", { class: "small" }, r.reason),
+          h("td", { class: "small muted" }, fmt.ago(r.created_at)),
+          h("td", {}, h("div", { class: "row" },
+            r.slug && !r.blocked && h("button", { class: "btn sm danger", onclick: () => block(r) }, "Block link"),
+            h("button", { class: "btn sm", onclick: () => dismiss(r) }, "Dismiss")))))))) : h("p", { class: "muted small" }, "Nothing reported. Visitors can report a link from its preview page (add + to any short link).")),
+    h("div", { class: "panel" }, h("h2", {}, `Users (${users.length})`),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "User"), h("th", { class: "num" }, "Links"), h("th", {}, "Last sign-in"), h("th", {}))),
+        h("tbody", {}, users.map((u) => h("tr", {},
+          h("td", {}, h("div", {}, u.email, u.banned ? h("span", { class: "badge blocked" }, "BANNED") : null), h("div", { class: "small muted" }, u.name || "")),
+          h("td", { class: "num" }, h("a", { href: "#/links", onclick: (e) => { e.preventDefault(); viewLinks(u.id); } }, fmt.n(u.links))),
+          h("td", { class: "small muted" }, fmt.ago(u.last_login_at)),
+          h("td", {}, u.id !== ME.user_id && h("button", { class: "btn sm" + (u.banned ? "" : " danger"), onclick: () => ban(u, !u.banned) }, u.banned ? "Unban" : "Ban")))))))),
+  );
+}
+
+// ---------- signed out: anonymous shortener ----------
+const ANON_KEY = "anon-links";
+function anonList() { try { return JSON.parse(localStorage.getItem(ANON_KEY) || "[]"); } catch { return []; } }
+function anonSave(list) { try { localStorage.setItem(ANON_KEY, JSON.stringify(list.slice(0, 200))); } catch {} }
+const forgetAnon = (token) => anonSave(anonList().filter((a) => a.token !== token));
+const manageUrl = (token) => `${ORIGIN}/_/#/m/${token}`;
+const signInUrl = (next = "/_/") => `/auth/login?next=${encodeURIComponent(next)}`;
+
+let turnstileReady;
+function loadTurnstile() {
+  turnstileReady ||= new Promise((resolve, reject) => {
+    const sc = document.createElement("script");
+    sc.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    sc.async = true;
+    sc.onload = () => resolve(window.turnstile);
+    sc.onerror = () => reject(new Error("Could not load the human check. Disable blockers for this page and reload."));
+    document.head.append(sc);
+  });
+  return turnstileReady;
+}
+
+async function publicHome() {
+  const signIn = CFG.google && h("a", { class: "btn primary", href: signInUrl(location.hash ? "/_/" + location.hash : "/_/") }, "Sign in with Google");
+  const perks = h("div", { class: "panel" }, h("h2", {}, "With an account"),
+    h("ul", { class: "small", style: "margin:0 0 14px; padding-left:18px" },
+      h("li", {}, "Links that never expire, with your own names"),
+      h("li", {}, "Analytics, QR codes, UTM builder, passwords, country and device rules"),
+      h("li", {}, "Edit or delete your links any time")),
+    signIn || h("p", { class: "muted small" }, "Sign-in is not available on this server."));
+
+  if (!CFG.anon.enabled) {
+    $app.replaceChildren(h("div", { class: "hero" }, h("h1", {}, "Short links"),
+      h("p", { class: "muted" }, "Sign in to create and manage short links."), perks));
+    return;
+  }
+
+  const url = h("input", { type: "url", required: true, placeholder: "Paste a long URL", autocomplete: "off" });
+  const style = h("select", { "aria-label": "Slug style" }, [["random", "k7RmQ2x"], ["words", "brave-otter-42"], ["names", "curious-lovelace"]].map(([v, l]) => h("option", { value: v }, l)));
+  const go = h("button", { class: "btn primary", type: "submit" }, "Shorten");
+  const ts = h("div", { class: "ts" });
+  const result = h("div");
+  let tsToken = "", tsWidget = null;
+  if (CFG.turnstile_site_key) {
+    loadTurnstile().then((T) => {
+      tsWidget = T.render(ts, { sitekey: CFG.turnstile_site_key, callback: (v) => (tsToken = v), "expired-callback": () => (tsToken = ""), "error-callback": () => (tsToken = "") });
+    }).catch((e) => toast(e.message, true));
+  }
+  async function submit(e) {
+    e.preventDefault();
+    if (CFG.turnstile_site_key && !tsToken) return toast("Wait for the human check to finish, then try again.", true);
+    go.disabled = true;
+    try {
+      const r = await api("POST", "/anon/links", { url: url.value.trim(), slug_style: style.value, turnstile: tsToken });
+      const l = r.link;
+      anonSave([{ token: r.manage_token, slug: l.slug, url: l.url, expires_at: l.expires_at, created_at: l.created_at }, ...anonList()]);
+      copy(shortUrl(l.slug));
+      url.value = "";
+      result.replaceChildren(h("div", { class: "result" },
+        h("div", { class: "shorturl" }, shortUrl(l.slug)),
+        h("div", { class: "row", style: "margin:8px 0" }, h("button", { class: "btn sm primary", type: "button", onclick: () => copy(shortUrl(l.slug)) }, "Copy"),
+          h("a", { class: "btn sm", href: `#/m/${r.manage_token}` }, "Stats and delete")),
+        h("p", { class: "muted small", style: "margin:0" }, `Expires ${fmt.date(l.expires_at)}. Keep this private manage link to see clicks or delete it: `,
+          h("span", { class: "mono" }, manageUrl(r.manage_token)))));
+      renderMine();
+    } catch (err) { toast(err.message, true); }
+    go.disabled = false;
+    if (tsWidget != null && window.turnstile) { window.turnstile.reset(tsWidget); tsToken = ""; }
+  }
+  const mine = h("div");
+  function renderMine() {
+    const list = anonList();
+    mine.replaceChildren(list.length ? h("div", { class: "panel", style: "margin-top:16px" }, h("h2", {}, "Links made on this device"),
+      h("div", { class: "table-wrap" }, h("table", {}, h("tbody", {}, list.map((a) => h("tr", { class: "link-row", onclick: () => (location.hash = `#/m/${a.token}`) },
+        h("td", {}, h("div", { class: "slug" }, "/" + a.slug), h("div", { class: "dest" }, a.url)),
+        h("td", { class: "small muted" }, a.expires_at && a.expires_at < Date.now() ? "expired" : `expires ${fmt.date(a.expires_at)}`),
+        h("td", {}, h("button", { class: "btn sm", onclick: (e) => { e.stopPropagation(); copy(shortUrl(a.slug)); } }, "Copy"))))))),
+      CFG.google && h("p", { class: "muted small", style: "margin:10px 0 0" }, "Sign in to move these links to your account.")) : "");
+  }
+  renderMine();
+  $app.replaceChildren(h("div", { class: "hero" },
+    h("h1", {}, "Shorten a link"),
+    h("p", { class: "muted" }, `No account needed. Links get a random name and expire after ${CFG.anon.ttl_days} days.`),
+    h("form", { class: "panel", onsubmit: submit }, h("div", { class: "shorten" }, url, style, go), ts, result),
+    h("p", { class: "muted small" }, "By creating a link you agree not to use it for spam, phishing or malware. Links are checked with Google Safe Browsing and can be reported."),
+    mine, h("div", { style: "margin-top:16px" }, perks)));
+  url.focus();
+}
+
+async function managePage(token) {
+  let link;
+  try { link = await api("GET", `/anon/${token}`); }
+  catch (e) {
+    // Only a 404 means the token is dead; keep it on network errors, 429s or 5xx.
+    if (e.status === 404) forgetAnon(token);
+    $app.replaceChildren(h("div", { class: "hero panel" }, h("h2", {}, e.status === 404 ? "Link not found" : "Could not load the link"), h("p", { class: "muted" }, e.message), h("a", { class: "btn", href: "#/" }, "Back")));
+    return;
+  }
+  async function del() {
+    if (!confirm(`Delete /${link.slug}? It stops working right away.`)) return;
+    try { await api("DELETE", `/anon/${token}`); forgetAnon(token); toast("Deleted"); location.hash = "#/"; }
+    catch (e) { toast(e.message, true); }
+  }
+  async function claim() {
+    try {
+      const r = await api("POST", "/claim", { tokens: [token] });
+      forgetAnon(token);
+      toast(r.claimed ? "Moved to your account" : "Nothing to move");
+      location.hash = "#/links";
+    } catch (e) { toast(e.message, true); }
+  }
+  const statsWrap = h("div", { class: "grid", style: "gap:16px; margin-top:16px" });
+  async function loadStats(r) {
+    const st = await api("GET", `/anon/${token}/stats?range=${r}`);
+    statsWrap.replaceChildren(
+      h("div", { class: "page-head", style: "margin:8px 0 0" }, h("h2", { style: "margin:0" }, "Clicks"), rangePicker(r, loadStats)),
+      h("div", { class: "grid g4" }, stat("Clicks", st.clicks), stat("QR scans", st.qr), stat("Bot hits", st.bots), stat("All-time clicks", link.clicks)),
+      ...statsBlock(st));
+  }
+  $app.replaceChildren(
+    h("div", { class: "page-head" },
+      h("div", {}, h("div", { class: "shorturl" }, shortUrl(link.slug)), h("div", { class: "dest" }, link.url),
+        h("div", { class: "muted small" }, `Created ${fmt.dt(link.created_at)} · ${link.status === "expired" ? "expired" : "expires " + fmt.dt(link.expires_at)}`)),
+      h("div", { class: "row" },
+        h("button", { class: "btn primary", onclick: () => copy(shortUrl(link.slug)) }, "Copy"),
+        ME ? h("button", { class: "btn", onclick: claim }, "Move to my account") : CFG.google && h("a", { class: "btn", href: signInUrl("/_/#/m/" + token) }, "Sign in to keep it"),
+        h("button", { class: "btn danger", onclick: del }, "Delete"))),
+    link.blocked && h("div", { class: "notice" }, "This link was blocked by an admin because it broke the rules of this service."),
+    statsWrap);
+  loadStats("30d");
+}
+
+async function reportPage(slug) {
+  const name = h("input", { type: "text", value: slug.replace(/\+$/, ""), required: true });
+  const reason = h("textarea", { required: true, maxlength: 1000, placeholder: "Phishing, malware, spam, or something else? Anything that helps." });
+  async function send(e) {
+    e.preventDefault();
+    try { await api("POST", "/report", { slug: name.value.trim(), reason: reason.value.trim() }); $app.replaceChildren(h("div", { class: "hero panel" }, h("h2", {}, "Thanks"), h("p", { class: "muted" }, "An admin will look at it."))); }
+    catch (err) { toast(err.message, true); }
+  }
+  $app.replaceChildren(h("div", { class: "hero" }, h("h1", {}, "Report a link"),
+    h("form", { class: "panel", onsubmit: send }, field("Short link", name, ORIGIN.replace(/^https?:\/\//, "") + "/…"), field("What is wrong with it?", reason),
+      h("button", { class: "btn primary", type: "submit" }, "Send report"))));
+}
+
+// ---------- account ----------
+async function signOut() {
+  try { await fetch("/auth/logout", { method: "POST", credentials: "same-origin" }); } catch {}
+  location.href = "/_/";
+}
+
+function renderHeader() {
+  const signedIn = !!ME;
+  document.getElementById("nav").hidden = !signedIn;
+  document.getElementById("new-link").hidden = !signedIn;
+  document.querySelectorAll("#nav [data-admin]").forEach((a) => (a.hidden = !isAdmin()));
+  document.getElementById("me").textContent = signedIn ? ME.name || ME.email : "";
+  const acc = document.getElementById("account");
+  acc.replaceChildren(
+    signedIn
+      ? (CFG.dev ? "" : h("button", { class: "btn sm", onclick: signOut }, "Sign out"))
+      : CFG.google ? h("a", { class: "btn sm", href: signInUrl("/_/" + (location.hash || "")) }, "Sign in") : "");
+}
+
+/// Anonymous links made on this device before signing in move to the account.
+async function claimDeviceLinks() {
+  // The server takes at most 50 tokens per call: send them in chunks and only forget
+  // the ones that were sent, so a failure keeps the rest for the next sign-in.
+  let list = anonList();
+  const sent = [];
+  let claimed = 0;
+  try {
+    while (list.length) {
+      const chunk = list.slice(0, 50).map((a) => a.token);
+      const r = await api("POST", "/claim", { tokens: chunk });
+      sent.push(...chunk);
+      claimed += r.claimed || 0;
+      list = list.slice(50);
+      anonSave(list);
+    }
+  } catch {}
+  if (claimed) toast(`Moved ${claimed} link${claimed === 1 ? "" : "s"} you made without an account to your account`);
+  return sent;
 }
 
 function applyTheme() {
@@ -705,6 +978,19 @@ function applyTheme() {
   if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
 }
 
-applyTheme();
-api("GET", "/me").then((m) => (document.getElementById("me").textContent = m.email)).catch(() => {});
-render();
+async function boot() {
+  applyTheme();
+  const [cfg, me] = await Promise.allSettled([api("GET", "/config"), api("GET", "/me")]);
+  if (cfg.status === "fulfilled") CFG = cfg.value;
+  ME = me.status === "fulfilled" ? me.value : null;
+  if (me.status === "rejected" && [403, 503].includes(me.reason.status)) toast(me.reason.message, true);
+  renderHeader();
+  if (ME) {
+    // Signed in from a manage page: that token was just claimed, so show the account's links.
+    const sent = await claimDeviceLinks();
+    const m = location.hash.match(/^#\/m\/([^/?]+)/);
+    if (m && sent.includes(m[1])) history.replaceState(null, "", "#/links");
+  }
+  render();
+}
+boot();

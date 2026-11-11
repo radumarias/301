@@ -71,6 +71,8 @@ jobs:
       ACCESS_TEAM_DOMAIN: ${{ vars.ACCESS_TEAM_DOMAIN }}
       PRIVACY_CONTACT: ${{ vars.PRIVACY_CONTACT }}
       DOMAIN: ${{ vars.DOMAIN }}
+      GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
+      TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -86,9 +88,24 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Provision KV, D1 and Cloudflare Access
+        env:
+          # Only checked for presence: Access is not removed while Google is half set up.
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: ./scripts/provision.sh
       - name: Apply D1 migrations
         run: npx wrangler d1 migrations apply DB --remote
+      - name: Set Worker secrets
+        env:
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          TURNSTILE_SECRET: ${{ secrets.TURNSTILE_SECRET }}
+          SAFE_BROWSING_KEY: ${{ secrets.SAFE_BROWSING_KEY }}
+        run: |
+          # Only the secrets that are set in GitHub are uploaded; the others are left as they are.
+          jq -n 'env | {GOOGLE_CLIENT_SECRET, TURNSTILE_SECRET, SAFE_BROWSING_KEY} | with_entries(select(.value != null and .value != ""))' > "$RUNNER_TEMP/secrets.json"
+          if [ "$(jq 'length' "$RUNNER_TEMP/secrets.json")" -gt 0 ]; then
+            npx wrangler secret bulk "$RUNNER_TEMP/secrets.json"
+          fi
+          rm -f "$RUNNER_TEMP/secrets.json"
       - name: Deploy Worker
         run: npx wrangler deploy
       - name: Smoke test
@@ -97,4 +114,4 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' https://$DOMAIN/robots.txt)
           echo "robots.txt -> $code"; test "$code" = 200
           code=$(curl -s -o /dev/null -w '%{http_code}' https://$DOMAIN/api/me)
-          echo "/api/me without login -> $code (expect 302/401/403 from Access)"; test "$code" != 200
+          echo "/api/me without login -> $code (expect 401 or a 302/403 from Access)"; test "$code" != 200

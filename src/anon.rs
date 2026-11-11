@@ -1,0 +1,178 @@
+//! Public endpoints: client config, anonymous links (no account) and abuse reports.
+//!
+//! Anonymous links get a random slug, expire after `anon_ttl_days`, and come with a secret
+//! manage token (only its hash is stored) that shows stats and deletes the link. Creating
+//! one needs a Turnstile pass, is limited per IP, and every destination is checked.
+
+use crate::account;
+use crate::api::body;
+use crate::auth;
+use crate::body;
+use crate::crypto::{random_token, token_hash};
+use crate::model::LinkInput;
+use crate::safety;
+use crate::store::{self, s, Settings};
+use crate::util::{json, json_error, now_ms};
+use serde::Deserialize;
+use worker::{Env, Method, Request, Response, Result};
+
+const HOUR_MS: i64 = 3_600_000;
+const REPORTS_PER_HOUR: i64 = 5;
+
+fn anon_available(req: &Request, env: &Env, st: &Settings) -> bool {
+    st.anon_enabled && (safety::turnstile_configured(env) || auth::dev_email(req, env).is_some())
+}
+
+pub async fn config(req: &Request, env: &Env) -> Result<Response> {
+    // Every page load asks for this: read settings from the edge cache, not D1.
+    let st = store::settings_cached(env).await;
+    let site_key = auth::var(env, "TURNSTILE_SITE_KEY");
+    json(
+        &serde_json::json!({
+            "google": auth::google_configured(env),
+            "dev": auth::dev_email(req, env).is_some(),
+            "turnstile_site_key": (safety::turnstile_configured(env)).then_some(site_key),
+            "anon": { "enabled": anon_available(req, env, &st), "ttl_days": st.anon_ttl_days },
+        }),
+        200,
+    )
+}
+
+#[derive(Deserialize)]
+struct Create {
+    url: String,
+    #[serde(default)]
+    slug_style: Option<String>,
+    #[serde(default)]
+    turnstile: String,
+}
+
+pub async fn create(mut req: Request, env: &Env) -> Result<Response> {
+    let st = store::settings(env).await.unwrap_or_default();
+    if !anon_available(&req, env, &st) {
+        return json_error(
+            "Creating links without an account is turned off. Sign in to create links.",
+            403,
+        );
+    }
+    let body: Create = body!(req);
+    let ip = safety::client_ip(&req);
+    if safety::turnstile_configured(env)
+        && !safety::turnstile_ok(env, &body.turnstile, ip.as_deref()).await
+    {
+        return json_error(
+            "The human check failed. Reload the page and try again.",
+            403,
+        );
+    }
+    let ip_hash = account::ip_hash(env, ip.as_deref().unwrap_or("local")).await?;
+    let Some(reservation) = account::reserve_creation(
+        env,
+        account::Creator::Ip(&ip_hash),
+        now_ms() - HOUR_MS,
+        st.anon_per_hour,
+    )
+    .await?
+    else {
+        return json_error(
+            "Too many links from your network in the last hour. Sign in, or try again later.",
+            429,
+        );
+    };
+
+    // Only a destination and a slug style: no custom slug or other options.
+    let input = LinkInput {
+        url: Some(body.url),
+        slug_style: body.slug_style,
+        ..Default::default()
+    };
+    let mut link = match store::new_link(env, &st, &input, "anonymous").await {
+        Ok(l) => l,
+        Err(e) => {
+            account::release_creation(env, reservation).await?;
+            return json_error(e.public_message(), 400);
+        }
+    };
+    // An unsafe destination keeps its reservation: probing for allowed URLs costs quota.
+    if let Err(e) = safety::check_link(env, &req, &link).await {
+        return json_error(e, 400);
+    }
+    let token = random_token(24);
+    link.expires_at = Some(link.created_at + st.anon_ttl_days * 24 * HOUR_MS);
+    link.manage_hash = Some(token_hash(&token).await?);
+    link.creator_ip = Some(ip_hash);
+    // No eager KV write: unclicked links (spam included) cost no KV writes.
+    match store::insert_link(env, link, false).await {
+        Ok(link) => json(
+            &serde_json::json!({ "link": link, "manage_token": token }),
+            201,
+        ),
+        Err(e) => json_error(e.public_message(), 500),
+    }
+}
+
+/// `GET /api/anon/<token>`, `GET /api/anon/<token>/stats`, `DELETE /api/anon/<token>`.
+pub async fn manage(
+    req: &Request,
+    env: &Env,
+    token: &str,
+    rest: &[String],
+    range: Option<&str>,
+) -> Result<Response> {
+    let links = store::query_links(
+        env,
+        "WHERE manage_hash = ?1",
+        &[s(&token_hash(token).await?)],
+    )
+    .await?;
+    let Some(link) = store::with_aliases(env, links).await?.pop() else {
+        return json_error(
+            "This manage link is not valid. The link may have been deleted or moved to an account.",
+            404,
+        );
+    };
+    match (req.method(), rest) {
+        (Method::Get, []) => json(&link, 200),
+        (Method::Get, [s]) if s == "stats" => {
+            crate::api::stats(env, Some(link.id), range.unwrap_or("30d"), None).await
+        }
+        (Method::Delete, []) if link.blocked => json_error(
+            "This link was blocked by an admin and cannot be deleted.",
+            403,
+        ),
+        (Method::Delete, []) => match store::delete_links(env, &[link]).await {
+            Ok(()) => json(&serde_json::json!({ "ok": true }), 200),
+            Err(e) => json_error(e.public_message(), 500),
+        },
+        _ => json_error("no such endpoint", 404),
+    }
+}
+
+#[derive(Deserialize)]
+struct Report {
+    slug: String,
+    reason: String,
+}
+
+pub async fn report(mut req: Request, env: &Env) -> Result<Response> {
+    let body: Report = body!(req);
+    let reason = body.reason.trim();
+    // Characters, like the form's maxlength, not bytes.
+    if reason.is_empty() || reason.chars().count() > 1000 {
+        return json_error(
+            "Tell us briefly what is wrong (up to 1000 characters).",
+            400,
+        );
+    }
+    let ip = safety::client_ip(&req);
+    let reporter = account::ip_hash(env, ip.as_deref().unwrap_or("local")).await?;
+    if account::reports_since(env, &reporter, now_ms() - HOUR_MS).await? >= REPORTS_PER_HOUR {
+        return json_error("Too many reports from your network. Try again later.", 429);
+    }
+    let slug = body.slug.trim().trim_start_matches('/');
+    let Some(link) = store::get_link_by_slug(env, slug).await? else {
+        return json_error("No short link with that name.", 404);
+    };
+    account::add_report(env, link.id, reason, Some(&reporter)).await?;
+    json(&serde_json::json!({ "ok": true }), 200)
+}

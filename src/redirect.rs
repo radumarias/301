@@ -69,7 +69,9 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
             };
         }
         "robots.txt" => {
-            return Response::ok("User-agent: *\nDisallow: /_/\nDisallow: /api/\n");
+            return Response::ok(
+                "User-agent: *\nDisallow: /_/\nDisallow: /api/\nDisallow: /auth/\n",
+            );
         }
         "privacy" => {
             let st = store::settings_cached(&env).await;
@@ -105,6 +107,9 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         };
     };
 
+    if rec.blocked {
+        return pages::gone("It was removed for breaking the rules of this service.");
+    }
     if rec.disabled {
         return pages::gone("It was disabled by its owner.");
     }

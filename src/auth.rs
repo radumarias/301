@@ -1,18 +1,25 @@
-//! Cloudflare Access JWT verification for the admin UI and API.
+//! Who is calling: a Google sign-in session (cookie), a Cloudflare Access JWT (admins and
+//! service tokens, when Access is configured), or the local-dev bypass.
 //!
-//! Access protects `/_/*` and `/api/*` at the edge; the Worker verifies the
-//! `Cf-Access-Jwt-Assertion` token again so a missing or wrong Access policy
-//! fails closed instead of exposing the admin.
+//! Admins are the emails in `ADMIN_EMAILS`. Everyone else who signs in is a regular user
+//! who only sees their own links.
 
+use crate::account;
 use crate::crypto::{b64url_decode, verify_rs256};
-use crate::util::{env_var as var, now_ms};
+pub use crate::util::env_var as var;
+use crate::util::now_ms;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use worker::{Env, Fetch, Request};
 
 #[derive(Debug, Clone)]
 pub struct Identity {
+    pub user_id: i64,
     pub email: String,
+    pub name: Option<String>,
+    pub admin: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -31,9 +38,18 @@ struct Header {
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
-enum Aud {
+pub enum Aud {
     One(String),
     Many(Vec<String>),
+}
+
+impl Aud {
+    pub fn contains(&self, aud: &str) -> bool {
+        match self {
+            Aud::One(a) => a == aud,
+            Aud::Many(v) => v.iter().any(|a| a == aud),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -49,31 +65,45 @@ pub struct Claims {
     common_name: Option<String>,
 }
 
-thread_local! {
-    static JWKS: RefCell<Option<(i64, String, Vec<serde_json::Value>)>> = const { RefCell::new(None) };
-    /// When this isolate last started a certs fetch (successful or not).
-    static JWKS_ATTEMPT: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
-    /// True while a certs fetch is in flight; concurrent requests wait for it.
-    static JWKS_FETCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+#[derive(Default)]
+struct JwksEntry {
+    /// When the keys were fetched (ms) and the keys; empty until the first success.
+    fetched_at: i64,
+    keys: Vec<serde_json::Value>,
+    /// When this isolate last started a fetch of this URL (successful or not).
+    attempt: i64,
+    /// True while a fetch is in flight; concurrent requests wait for it.
+    fetching: bool,
 }
 
-fn list(v: &str) -> Vec<String> {
+thread_local! {
+    /// JWKS by certs URL (Access certs, Google certs).
+    static JWKS: RefCell<HashMap<String, JwksEntry>> = RefCell::new(HashMap::new());
+}
+
+const JWKS_TTL_MS: i64 = 3_600_000;
+/// An unknown `kid` or a failed signature (key rotation) refetches early, but fetch
+/// attempts, successful or not, start at most this often per isolate and URL, so forged
+/// tokens cannot turn requests into fetches of the certs.
+const JWKS_MIN_REFRESH_MS: i64 = 60_000;
+
+pub fn list(v: &str) -> Vec<String> {
     v.split(',')
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn token_from(req: &Request) -> Option<String> {
-    if let Ok(Some(t)) = req.headers().get("Cf-Access-Jwt-Assertion") {
-        return Some(t);
-    }
-    let cookies = req.headers().get("Cookie").ok().flatten()?;
-    cookies
-        .split(';')
-        .filter_map(|c| c.trim().split_once('='))
-        .find(|(k, _)| *k == "CF_Authorization")
-        .map(|(_, v)| v.to_string())
+pub fn is_admin(env: &Env, email: &str) -> bool {
+    list(&var(env, "ADMIN_EMAILS")).contains(&email.to_lowercase())
+}
+
+pub fn google_configured(env: &Env) -> bool {
+    !var(env, "GOOGLE_CLIENT_ID").is_empty() && !var(env, "GOOGLE_CLIENT_SECRET").is_empty()
+}
+
+fn access_configured(env: &Env) -> bool {
+    !var(env, "ACCESS_TEAM_DOMAIN").is_empty() && !var(env, "ACCESS_AUD").is_empty()
 }
 
 fn is_local(req: &Request) -> bool {
@@ -81,11 +111,20 @@ fn is_local(req: &Request) -> bool {
         .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
 }
 
-const JWKS_TTL_MS: i64 = 3_600_000;
-/// An unknown `kid` or a failed signature (key rotation) refetches early, but fetch
-/// attempts, successful or not, start at most this often per isolate, so forged tokens
-/// cannot turn requests into fetches of the Access certs.
-const JWKS_MIN_REFRESH_MS: i64 = 60_000;
+/// Local development only (`.dev.vars`): ignored as soon as Access or Google is configured,
+/// and only honoured on a loopback host, so it can never open a deployed Worker.
+pub fn dev_email(req: &Request, env: &Env) -> Option<String> {
+    let dev = var(env, "DEV_AUTH_EMAIL");
+    (!dev.is_empty() && !access_configured(env) && !google_configured(env) && is_local(req))
+        .then_some(dev)
+}
+
+fn access_token(req: &Request) -> Option<String> {
+    if let Ok(Some(t)) = req.headers().get("Cf-Access-Jwt-Assertion") {
+        return Some(t);
+    }
+    account::cookie(req, "CF_Authorization")
+}
 
 fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
     kid.is_none_or(|kid| {
@@ -94,66 +133,108 @@ fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
     })
 }
 
-fn cached_keys(
-    team: &str,
-    ok: impl Fn(i64, &[serde_json::Value]) -> bool,
-) -> Option<Vec<serde_json::Value>> {
-    JWKS.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|(at, t, keys)| t == team && ok(*at, keys))
-            .map(|(_, _, k)| k.clone())
-    })
+fn with_entry<R>(url: &str, f: impl FnOnce(&mut JwksEntry) -> R) -> R {
+    JWKS.with(|c| f(c.borrow_mut().entry(url.to_string()).or_default()))
 }
 
-async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
+async fn jwks(url: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
+    let fresh = |e: &JwksEntry, now: i64| {
+        !e.keys.is_empty() && now - e.fetched_at < JWKS_TTL_MS && has_kid(&e.keys, kid)
+    };
     // Fresh keys that know this `kid` need no fetch, even while one is in flight.
     let start = now_ms();
-    if let Some(k) = cached_keys(team, |at, keys| {
-        start - at < JWKS_TTL_MS && has_kid(keys, kid)
-    }) {
+    if let Some(k) = with_entry(url, |e| fresh(e, start).then(|| e.keys.clone())) {
         return Ok(k);
     }
     // Another request in this isolate is fetching: wait for its result instead of
-    // failing or starting a second fetch (the admin UI sends requests in parallel).
+    // failing or starting a second fetch (the UI sends requests in parallel).
     let mut waited = 0;
-    while JWKS_FETCHING.get() && waited < 10_000 {
+    while with_entry(url, |e| e.fetching) && waited < 10_000 {
         worker::Delay::from(std::time::Duration::from_millis(25)).await;
         waited += 25;
     }
     let now = now_ms();
-    // Recorded before awaiting, so concurrent requests and failed fetches count too.
-    let recent_attempt = now - JWKS_ATTEMPT.get() < JWKS_MIN_REFRESH_MS;
-    if let Some(k) = cached_keys(team, |at, keys| {
-        recent_attempt || (now - at < JWKS_TTL_MS && has_kid(keys, kid))
+    let recent_attempt = with_entry(url, |e| now - e.attempt < JWKS_MIN_REFRESH_MS);
+    if let Some(k) = with_entry(url, |e| {
+        (!e.keys.is_empty() && (recent_attempt || fresh(e, now))).then(|| e.keys.clone())
     }) {
         return Ok(k);
     }
     if recent_attempt {
         return Err(worker::Error::RustError(
-            "Access certs fetch failed recently; retrying shortly".into(),
+            "certs fetch failed recently; retrying shortly".into(),
         ));
     }
-    JWKS_ATTEMPT.set(now);
-    JWKS_FETCHING.set(true);
-    let res = fetch_jwks(team).await;
-    JWKS_FETCHING.set(false);
+    // Recorded before awaiting, so concurrent requests and failed fetches count too.
+    with_entry(url, |e| {
+        e.attempt = now;
+        e.fetching = true;
+    });
+    let res = fetch_jwks(url).await;
+    with_entry(url, |e| e.fetching = false);
     let keys = res?;
-    JWKS.with(|c| *c.borrow_mut() = Some((now, team.to_string(), keys.clone())));
+    with_entry(url, |e| {
+        e.fetched_at = now;
+        e.keys = keys.clone();
+    });
     Ok(keys)
 }
 
-async fn fetch_jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
+async fn fetch_jwks(url: &str) -> worker::Result<Vec<serde_json::Value>> {
     #[derive(Deserialize)]
     struct Jwks {
         keys: Vec<serde_json::Value>,
     }
-    let url = format!("https://{team}/cdn-cgi/access/certs");
     let mut res = Fetch::Url(url.parse()?).send().await?;
     Ok(res.json::<Jwks>().await?.keys)
 }
 
-/// Pure claim checks, separated for unit testing.
+/// Verifies an RS256 JWT against the JWKS at `certs_url` and returns its claims.
+/// Claim checks (issuer, audience, expiry) are the caller's job.
+pub async fn verify_jwt<T: DeserializeOwned>(token: &str, certs_url: &str) -> Result<T, AuthError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AuthError::Denied("malformed token".into()));
+    }
+    let header: Header = b64url_decode(parts[0])
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| AuthError::Denied("bad token header".into()))?;
+    if header.alg != "RS256" {
+        return Err(AuthError::Denied("unexpected token algorithm".into()));
+    }
+    let claims: T = b64url_decode(parts[1])
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| AuthError::Denied("bad token payload".into()))?;
+    let sig =
+        b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
+
+    let keys = jwks(certs_url, header.kid.as_deref())
+        .await
+        .map_err(|e| AuthError::Denied(format!("could not fetch signing keys: {e}")))?;
+    let candidates: Vec<&serde_json::Value> = keys
+        .iter()
+        .filter(|k| match &header.kid {
+            Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid.as_str()),
+            None => true,
+        })
+        .collect();
+    let signed = format!("{}.{}", parts[0], parts[1]);
+    for k in candidates {
+        if verify_rs256(k, signed.as_bytes(), &sig)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(claims);
+        }
+    }
+    // Keys may have rotated under a token without a `kid`: expire the cache so the next
+    // request refetches (still subject to the attempt limit in `jwks`).
+    with_entry(certs_url, |e| e.fetched_at = 0);
+    Err(AuthError::Denied("invalid token signature".into()))
+}
+
+/// Pure Access claim checks, separated for unit testing. Returns the identity's email
+/// (or `service:<client id>` for a service token).
 pub fn check_claims(
     c: &Claims,
     aud: &str,
@@ -161,12 +242,8 @@ pub fn check_claims(
     now_s: i64,
     emails: &[String],
     service_tokens: &[String],
-) -> Result<Identity, AuthError> {
-    let aud_ok = match &c.aud {
-        Aud::One(a) => a == aud,
-        Aud::Many(v) => v.iter().any(|a| a == aud),
-    };
-    if !aud_ok {
+) -> Result<String, AuthError> {
+    if !c.aud.contains(aud) {
         return Err(AuthError::Denied("token audience mismatch".into()));
     }
     if c.iss.trim_end_matches('/') != format!("https://{team}") {
@@ -185,95 +262,31 @@ pub fn check_claims(
         .filter(|e| !e.is_empty())
     {
         if emails.contains(&email) {
-            return Ok(Identity { email });
+            return Ok(email);
         }
         return Err(AuthError::Denied(format!("{email} is not an admin")));
     }
     if let Some(cn) = c.common_name.as_deref().map(str::to_lowercase) {
         if service_tokens.contains(&cn) {
-            return Ok(Identity {
-                email: format!("service:{cn}"),
-            });
+            return Ok(format!("service:{cn}"));
         }
     }
     Err(AuthError::Denied("identity not allowed".into()))
 }
 
-pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
-    let team = var(env, "ACCESS_TEAM_DOMAIN");
-    let aud = var(env, "ACCESS_AUD");
-
-    // Local development only (`.dev.vars`). Ignored as soon as Access is configured,
-    // and only honoured on a loopback host, so it can never open a deployed Worker.
-    let dev = var(env, "DEV_AUTH_EMAIL");
-    if !dev.is_empty() && aud.is_empty() && team.is_empty() && is_local(req) {
-        return Ok(Identity { email: dev });
-    }
-
+/// Cloudflare Access: admins and service tokens only.
+async fn verify_access(token: &str, env: &Env) -> Result<String, AuthError> {
     let emails = list(&var(env, "ADMIN_EMAILS"));
     let service_tokens = list(&var(env, "ADMIN_SERVICE_TOKENS"));
-    if team.is_empty() || aud.is_empty() {
-        return Err(AuthError::NotConfigured(
-            "ACCESS_TEAM_DOMAIN and ACCESS_AUD must be set",
-        ));
-    }
     if emails.is_empty() && service_tokens.is_empty() {
         return Err(AuthError::NotConfigured("ADMIN_EMAILS must be set"));
     }
-    let team = team
+    let aud = var(env, "ACCESS_AUD");
+    let team = var(env, "ACCESS_TEAM_DOMAIN")
         .trim_start_matches("https://")
         .trim_end_matches('/')
         .to_string();
-
-    let token = token_from(req)
-        .ok_or_else(|| AuthError::Denied("missing Cloudflare Access token".into()))?;
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(AuthError::Denied("malformed token".into()));
-    }
-    let header: Header = b64url_decode(parts[0])
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| AuthError::Denied("bad token header".into()))?;
-    if header.alg != "RS256" {
-        return Err(AuthError::Denied("unexpected token algorithm".into()));
-    }
-    let claims: Claims = b64url_decode(parts[1])
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| AuthError::Denied("bad token payload".into()))?;
-    let sig =
-        b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
-
-    let keys = jwks(&team, header.kid.as_deref())
-        .await
-        .map_err(|e| AuthError::Denied(format!("could not fetch Access certs: {e}")))?;
-    let candidates: Vec<&serde_json::Value> = keys
-        .iter()
-        .filter(|k| match &header.kid {
-            Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid.as_str()),
-            None => true,
-        })
-        .collect();
-    let signed = format!("{}.{}", parts[0], parts[1]);
-    let mut valid = false;
-    for k in candidates {
-        if verify_rs256(k, signed.as_bytes(), &sig)
-            .await
-            .unwrap_or(false)
-        {
-            valid = true;
-            break;
-        }
-    }
-    if !valid {
-        // Keys may have rotated under a token without a `kid`: expire the cache so the
-        // next request refetches (still subject to the attempt limit in `jwks`).
-        JWKS.with(|c| {
-            if let Some((at, _, _)) = c.borrow_mut().as_mut() {
-                *at = 0;
-            }
-        });
-        return Err(AuthError::Denied("invalid token signature".into()));
-    }
+    let claims: Claims = verify_jwt(token, &format!("https://{team}/cdn-cgi/access/certs")).await?;
     check_claims(
         &claims,
         &aud,
@@ -282,6 +295,55 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
         &emails,
         &service_tokens,
     )
+}
+
+fn internal(e: worker::Error) -> AuthError {
+    worker::console_error!("auth: {e}");
+    AuthError::Denied("could not check your session, try again".into())
+}
+
+async fn identity_for_email(env: &Env, email: String, admin: bool) -> Result<Identity, AuthError> {
+    let user_id = account::user_id_for_email(env, &email)
+        .await
+        .map_err(internal)?;
+    Ok(Identity {
+        user_id,
+        email,
+        name: None,
+        admin,
+    })
+}
+
+/// The caller's identity, `Ok(None)` when not signed in.
+pub async fn identify(req: &Request, env: &Env) -> Result<Option<Identity>, AuthError> {
+    if let Some(token) = account::cookie(req, account::SESSION_COOKIE) {
+        if let Some(u) = account::session_user(env, &token).await.map_err(internal)? {
+            if u.banned != 0 {
+                return Err(AuthError::Denied("This account is suspended.".into()));
+            }
+            return Ok(Some(Identity {
+                user_id: u.id,
+                admin: is_admin(env, &u.email),
+                email: u.email,
+                name: u.name,
+            }));
+        }
+    }
+    if let Some(dev) = dev_email(req, env) {
+        return identity_for_email(env, dev, true).await.map(Some);
+    }
+    if access_configured(env) {
+        if let Some(token) = access_token(req) {
+            let email = verify_access(&token, env).await?;
+            return identity_for_email(env, email, true).await.map(Some);
+        }
+    }
+    if !google_configured(env) && !access_configured(env) {
+        return Err(AuthError::NotConfigured(
+            "Sign-in is not configured: set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (or Cloudflare Access).",
+        ));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -299,9 +361,7 @@ mod tests {
             r#"{"aud":["AUD"],"iss":"https://t.cloudflareaccess.com","exp":2000,"email":"Radu@example.com"}"#,
         );
         assert_eq!(
-            check_claims(&ok, "AUD", "t.cloudflareaccess.com", 1000, &emails, &[])
-                .unwrap()
-                .email,
+            check_claims(&ok, "AUD", "t.cloudflareaccess.com", 1000, &emails, &[]).unwrap(),
             "radu@example.com"
         );
 

@@ -14,7 +14,12 @@ use worker::{D1Database, D1PreparedStatement, Env, KvStore};
 
 pub const KV_CACHE_TTL: u64 = 60;
 
-pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at";
+pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at, \
+     owner_id, manage_hash, creator_ip, blocked";
+
+/// Extra column for admin views: the owner's email (append to `LINK_COLS`).
+pub const OWNER_EMAIL_COL: &str =
+    "(SELECT email FROM users WHERE users.id = links.owner_id) AS owner_email";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -84,7 +89,7 @@ pub fn n(v: i64) -> JsValue {
 pub fn on(v: Option<i64>) -> JsValue {
     v.map(n).unwrap_or(JsValue::NULL)
 }
-fn b(v: bool) -> JsValue {
+pub fn b(v: bool) -> JsValue {
     n(v as i64)
 }
 fn json_or_null<T: Serialize>(v: &T, empty: bool) -> JsValue {
@@ -112,6 +117,14 @@ pub struct Settings {
     pub default_redirect: u16,
     pub default_slug_style: String,
     pub default_slug_length: usize,
+    /// Anyone can create links without signing in (also needs Turnstile configured).
+    pub anon_enabled: bool,
+    /// Anonymous links expire after this many days.
+    pub anon_ttl_days: i64,
+    /// Anonymous links one IP may create per hour.
+    pub anon_per_hour: i64,
+    /// Links a signed-in (non-admin) user may create per day.
+    pub user_per_day: i64,
     /// Click events older than this are deleted by the hourly cron (0 keeps them forever).
     /// Per-link click totals are kept.
     pub click_retention_days: u32,
@@ -128,6 +141,10 @@ impl Default for Settings {
             default_redirect: 302,
             default_slug_style: "random".into(),
             default_slug_length: 7,
+            anon_enabled: true,
+            anon_ttl_days: 30,
+            anon_per_hour: 10,
+            user_per_day: 100,
             click_retention_days: DEFAULT_CLICK_RETENTION_DAYS,
         }
     }
@@ -141,6 +158,12 @@ impl Settings {
         validate_redirect_type(self.default_redirect)?;
         if !(4..=32).contains(&self.default_slug_length) {
             return Err("default_slug_length must be between 4 and 32".into());
+        }
+        if !(1..=365).contains(&self.anon_ttl_days) {
+            return Err("anonymous links must expire after 1 to 365 days".into());
+        }
+        if !(0..=1000).contains(&self.anon_per_hour) || !(0..=10_000).contains(&self.user_per_day) {
+            return Err("creation limits must be between 0 and 1000 (anonymous, per hour) and 0 and 10000 (per user, per day)".into());
         }
         if self.click_retention_days > 3650 {
             return Err(
@@ -363,21 +386,36 @@ fn link_binds(l: &Link) -> Vec<JsValue> {
 
 pub fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
     let mut binds = link_binds(l);
-    binds.push(n(l.created_at));
+    binds.extend([
+        n(l.created_at),
+        on(l.owner_id),
+        os(&l.manage_hash),
+        os(&l.creator_ip),
+        b(l.blocked),
+    ]);
     db.prepare(
-        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING id",
+        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, \
+         created_at, owner_id, manage_hash, creator_ip, blocked) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22) RETURNING id",
     )
     .bind(&binds)
 }
 
-pub fn update_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
+/// Ownership columns are not written here: see `claim_*` in `account`. `blocked` is only
+/// written for a moderation action (`block`), so an edit that loaded the link earlier can
+/// never undo a block made in the meantime.
+pub fn update_stmt(
+    db: &D1Database,
+    l: &Link,
+    block: Option<bool>,
+) -> worker::Result<D1PreparedStatement> {
     let mut binds = link_binds(l);
+    binds.push(block.map(b).unwrap_or(JsValue::NULL));
     binds.push(n(l.id));
     db.prepare(
         "UPDATE links SET slug = ?1, url = ?2, title = ?3, notes = ?4, tags = ?5, redirect_type = ?6, disabled = ?7, expires_at = ?8, \
-         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17 \
-         WHERE id = ?18",
+         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17, \
+         blocked = COALESCE(?18, blocked) WHERE id = ?19",
     )
     .bind(&binds)
 }
@@ -404,16 +442,19 @@ pub async fn new_link(env: &Env, st: &Settings, input: &LinkInput, source: &str)
     Ok(link)
 }
 
-pub async fn create_link(env: &Env, input: &LinkInput) -> SResult<Link> {
-    let st = settings(env).await.unwrap_or_default();
-    let mut link = new_link(env, &st, input, "manual").await?;
+/// Saves a link built with `new_link`. With `write_kv` its KV record is written now;
+/// otherwise the first click fills it (read-through), which costs no KV write for
+/// links nobody clicks.
+pub async fn insert_link(env: &Env, mut link: Link, write_kv: bool) -> SResult<Link> {
     let row = insert_stmt(&db(env)?, &link)?.first::<IdRow>(None).await?;
     link.id = row
         .ok_or_else(|| {
             StoreError::Internal(worker::Error::RustError("insert returned no id".into()))
         })?
         .id;
-    sync_kv(env, &link).await?;
+    if write_kv {
+        sync_kv(env, &link).await?;
+    }
     Ok(link.with_status())
 }
 
@@ -455,20 +496,66 @@ pub async fn prepare_update(
         link.slug = new_slug;
     }
     link.updated_at = now_ms();
-    stmts.insert(0, update_stmt(&d, link)?);
+    stmts.insert(0, update_stmt(&d, link, input.blocked)?);
     Ok(stmts)
 }
 
-pub async fn update_loaded(env: &Env, mut link: Link, input: &LinkInput) -> SResult<Link> {
-    let stmts = prepare_update(env, &mut link, input).await?;
+/// Runs the statements from `prepare_update` and refreshes the link's KV records.
+pub async fn save_update(
+    env: &Env,
+    mut link: Link,
+    stmts: Vec<D1PreparedStatement>,
+) -> SResult<Link> {
     db(env)?.batch(stmts).await?;
+    refresh_blocked(env, std::slice::from_mut(&mut link)).await?;
     sync_kv(env, &link).await?;
     Ok(link.with_status())
 }
 
-pub async fn update_link(env: &Env, id: i64, input: &LinkInput) -> SResult<Link> {
-    let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    update_loaded(env, link, input).await
+/// Re-reads `blocked` after an update, so the KV record written next carries a block an
+/// admin made while the edit was in progress.
+pub async fn refresh_blocked(env: &Env, links: &mut [Link]) -> SResult<()> {
+    #[derive(Deserialize)]
+    struct Row {
+        id: i64,
+        blocked: i64,
+    }
+    let d = db(env)?;
+    for chunk in links.chunks_mut(90) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
+        let rows = d
+            .prepare(format!(
+                "SELECT id, blocked FROM links WHERE id IN ({marks})"
+            ))
+            .bind(&ids)?
+            .all()
+            .await?
+            .results::<Row>()?;
+        let blocked: HashMap<i64, bool> =
+            rows.into_iter().map(|r| (r.id, r.blocked != 0)).collect();
+        for l in chunk {
+            if let Some(&b) = blocked.get(&l.id) {
+                l.blocked = b;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Owner and blocked flag of a link, without loading the whole row.
+pub async fn link_access(env: &Env, id: i64) -> worker::Result<Option<(Option<i64>, bool)>> {
+    #[derive(Deserialize)]
+    struct Row {
+        owner_id: Option<i64>,
+        blocked: i64,
+    }
+    Ok(db(env)?
+        .prepare("SELECT owner_id, blocked FROM links WHERE id = ?1")
+        .bind(&[n(id)])?
+        .first::<Row>(None)
+        .await?
+        .map(|r| (r.owner_id, r.blocked != 0)))
 }
 
 /// Deletes links (with their aliases and clicks) and their KV records.
@@ -495,11 +582,6 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
         .flat_map(|l| std::iter::once(l.slug.as_str()).chain(l.aliases.iter().map(String::as_str)))
         .collect();
     forget_kv(env, &slugs).await
-}
-
-pub async fn delete_link(env: &Env, id: i64) -> SResult<()> {
-    let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    delete_links(env, &[link]).await
 }
 
 pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
-  <title>301 admin</title>
+  <title>301.xorio.rs</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,15 +15,17 @@
 <body>
   <header class="top">
     <a class="brand" href="#/"><span class="logo">301</span><span class="brand-name">xorio.rs</span></a>
-    <nav id="nav">
+    <nav id="nav" hidden>
       <a href="#/" data-nav="dash">Dashboard</a>
       <a href="#/links" data-nav="links">Links</a>
-      <a href="#/import" data-nav="import">Import</a>
+      <a href="#/import" data-nav="import" data-admin>Import</a>
+      <a href="#/moderation" data-nav="moderation" data-admin>Moderation</a>
       <a href="#/settings" data-nav="settings">Settings</a>
     </nav>
     <div class="top-right">
-      <button class="btn primary" id="new-link" title="New link (n)">New link</button>
+      <button class="btn primary" id="new-link" title="New link (n)" hidden>New link</button>
       <span id="me" class="muted small"></span>
+      <span id="account"></span>
     </div>
   </header>
   <main id="app"><p class="muted">Loading…</p></main>
