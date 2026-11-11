@@ -107,6 +107,13 @@ fn cached_keys(
 }
 
 async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
+    // Fresh keys that know this `kid` need no fetch, even while one is in flight.
+    let start = now_ms();
+    if let Some(k) = cached_keys(team, |at, keys| {
+        start - at < JWKS_TTL_MS && has_kid(keys, kid)
+    }) {
+        return Ok(k);
+    }
     // Another request in this isolate is fetching: wait for its result instead of
     // failing or starting a second fetch (the admin UI sends requests in parallel).
     let mut waited = 0;
