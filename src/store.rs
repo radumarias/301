@@ -112,7 +112,13 @@ pub struct Settings {
     pub default_redirect: u16,
     pub default_slug_style: String,
     pub default_slug_length: usize,
+    /// Click events older than this are deleted by the hourly cron (0 keeps them forever).
+    /// Per-link click totals are kept.
+    pub click_retention_days: u32,
 }
+
+/// Default retention for click events: 13 months.
+pub const DEFAULT_CLICK_RETENTION_DAYS: u32 = 395;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -122,6 +128,7 @@ impl Default for Settings {
             default_redirect: 302,
             default_slug_style: "random".into(),
             default_slug_length: 7,
+            click_retention_days: DEFAULT_CLICK_RETENTION_DAYS,
         }
     }
 }
@@ -134,6 +141,11 @@ impl Settings {
         validate_redirect_type(self.default_redirect)?;
         if !(4..=32).contains(&self.default_slug_length) {
             return Err("default_slug_length must be between 4 and 32".into());
+        }
+        if self.click_retention_days > 3650 {
+            return Err(
+                "click_retention_days must be at most 3650 (0 keeps clicks forever)".into(),
+            );
         }
         Ok(())
     }
@@ -168,18 +180,33 @@ pub async fn settings_cached(env: &Env) -> Settings {
     }
 }
 
-pub async fn settings(env: &Env) -> worker::Result<Settings> {
+async fn settings_row(env: &Env) -> worker::Result<Option<String>> {
     #[derive(Deserialize)]
     struct Row {
         value: String,
     }
-    let row = db(env)?
+    Ok(db(env)?
         .prepare("SELECT value FROM settings WHERE key = 'settings'")
         .first::<Row>(None)
-        .await?;
-    Ok(row
-        .and_then(|r| serde_json::from_str(&r.value).ok())
+        .await?
+        .map(|r| r.value))
+}
+
+pub async fn settings(env: &Env) -> worker::Result<Settings> {
+    Ok(settings_row(env)
+        .await?
+        .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or_default())
+}
+
+/// Like `settings`, but a stored value that does not parse is an error instead of the
+/// defaults, so destructive jobs never act on a retention the owner did not choose.
+async fn settings_strict(env: &Env) -> worker::Result<Settings> {
+    match settings_row(env).await? {
+        None => Ok(Settings::default()),
+        Some(v) => serde_json::from_str(&v)
+            .map_err(|e| worker::Error::RustError(format!("stored settings do not parse: {e}"))),
+    }
 }
 
 pub async fn save_settings(env: &Env, st: &Settings) -> SResult<()> {
@@ -572,6 +599,35 @@ pub struct Click<'a> {
     pub browser: &'a str,
     pub bot: bool,
     pub qr: bool,
+}
+
+/// Deletes click events older than the retention setting, in bounded chunks.
+/// Returns the number of rows deleted.
+pub async fn purge_old_clicks(env: &Env) -> worker::Result<usize> {
+    let days = settings_strict(env).await?.click_retention_days;
+    if days == 0 {
+        return Ok(0);
+    }
+    let cutoff = crate::util::now_ms() - i64::from(days) * 86_400_000;
+    let d = db(env)?;
+    let mut total = 0;
+    const CHUNK: usize = 5000;
+    // A few bounded chunks per run keep each statement short; the next run continues.
+    for _ in 0..20 {
+        let res = d
+            .prepare(
+                "DELETE FROM clicks WHERE id IN (SELECT id FROM clicks WHERE ts < ?1 LIMIT ?2)",
+            )
+            .bind(&[n(cutoff), n(CHUNK as i64)])?
+            .run()
+            .await?;
+        let changed = res.meta()?.and_then(|m| m.changes).unwrap_or(0);
+        total += changed;
+        if changed < CHUNK {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 pub async fn record_click(env: &Env, c: Click<'_>) -> worker::Result<()> {

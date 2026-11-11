@@ -58,7 +58,11 @@ echo "== Admin emails"
 if [[ -z "${ADMIN_EMAILS:-}" ]]; then
   ADMIN_EMAILS=$(cf GET "$API/user" | jq -r '.result.email')
 fi
-echo "   $ADMIN_EMAILS"
+# CI logs of a public repo are public: mask the addresses and never print them.
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  for e in ${ADMIN_EMAILS//,/ }; do echo "::add-mask::$e"; done
+fi
+echo "   $(awk -F, '{print NF}' <<<"$ADMIN_EMAILS") address(es)"
 
 echo "== Access team domain"
 if [[ -z "${ACCESS_TEAM_DOMAIN:-}" ]]; then
@@ -111,6 +115,9 @@ else
 fi
 
 echo "== Writing $TOML"
+# A free-form value as a TOML string body, safe inside the sed replacement below.
+toml_sed() { local v=${1//\\/\\\\}; v=${v//\"/\\\"}; printf '%s' "$v" | sed -e 's/[\\&|]/\\&/g'; }
+PRIVACY_CONTACT_ESC=$(toml_sed "${PRIVACY_CONTACT:-}")
 sed -i.bak \
   -e "s|^id = \"REPLACE_KV_ID\"|id = \"$KV_ID\"|" \
   -e "s|^database_id = \"REPLACE_D1_ID\"|database_id = \"$D1_ID\"|" \
@@ -118,7 +125,8 @@ sed -i.bak \
   -e "s|^ACCESS_AUD = \".*\"|ACCESS_AUD = \"$ACCESS_AUD\"|" \
   -e "s|^ADMIN_EMAILS = \".*\"|ADMIN_EMAILS = \"$ADMIN_EMAILS\"|" \
   -e "s|^ADMIN_SERVICE_TOKENS = \".*\"|ADMIN_SERVICE_TOKENS = \"${ADMIN_SERVICE_TOKENS:-}\"|" \
+  -e "s|^PRIVACY_CONTACT = \".*\"|PRIVACY_CONTACT = \"$PRIVACY_CONTACT_ESC\"|" \
   "$TOML"
 rm -f "$TOML.bak"
-grep -nE '^(id|database_id|ACCESS_TEAM_DOMAIN|ACCESS_AUD|ADMIN_EMAILS) =' "$TOML"
+grep -nE '^(id|database_id|ACCESS_TEAM_DOMAIN|ACCESS_AUD) =' "$TOML"
 echo "Provisioned."

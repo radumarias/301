@@ -5,7 +5,7 @@
 //! fails closed instead of exposing the admin.
 
 use crate::crypto::{b64url_decode, verify_rs256};
-use crate::util::now_ms;
+use crate::util::{env_var as var, now_ms};
 use serde::Deserialize;
 use std::cell::RefCell;
 use worker::{Env, Fetch, Request};
@@ -51,14 +51,10 @@ pub struct Claims {
 
 thread_local! {
     static JWKS: RefCell<Option<(i64, String, Vec<serde_json::Value>)>> = const { RefCell::new(None) };
-}
-
-fn var(env: &Env, name: &str) -> String {
-    env.var(name)
-        .map(|v| v.to_string())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    /// When this isolate last started a certs fetch (successful or not).
+    static JWKS_ATTEMPT: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// True while a certs fetch is in flight; concurrent requests wait for it.
+    static JWKS_FETCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn list(v: &str) -> Vec<String> {
@@ -80,26 +76,81 @@ fn token_from(req: &Request) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-async fn jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
-    let now = now_ms();
-    let cached = JWKS.with(|c| {
+fn is_local(req: &Request) -> bool {
+    req.url()
+        .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+}
+
+const JWKS_TTL_MS: i64 = 3_600_000;
+/// An unknown `kid` or a failed signature (key rotation) refetches early, but fetch
+/// attempts, successful or not, start at most this often per isolate, so forged tokens
+/// cannot turn requests into fetches of the Access certs.
+const JWKS_MIN_REFRESH_MS: i64 = 60_000;
+
+fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
+    kid.is_none_or(|kid| {
+        keys.iter()
+            .any(|k| k.get("kid").and_then(|v| v.as_str()) == Some(kid))
+    })
+}
+
+fn cached_keys(
+    team: &str,
+    ok: impl Fn(i64, &[serde_json::Value]) -> bool,
+) -> Option<Vec<serde_json::Value>> {
+    JWKS.with(|c| {
         c.borrow()
             .as_ref()
-            .filter(|(at, t, _)| t == team && now - at < 3_600_000)
+            .filter(|(at, t, keys)| t == team && ok(*at, keys))
             .map(|(_, _, k)| k.clone())
-    });
-    if let Some(k) = cached {
+    })
+}
+
+async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
+    // Fresh keys that know this `kid` need no fetch, even while one is in flight.
+    let start = now_ms();
+    if let Some(k) = cached_keys(team, |at, keys| {
+        start - at < JWKS_TTL_MS && has_kid(keys, kid)
+    }) {
         return Ok(k);
     }
+    // Another request in this isolate is fetching: wait for its result instead of
+    // failing or starting a second fetch (the admin UI sends requests in parallel).
+    let mut waited = 0;
+    while JWKS_FETCHING.get() && waited < 10_000 {
+        worker::Delay::from(std::time::Duration::from_millis(25)).await;
+        waited += 25;
+    }
+    let now = now_ms();
+    // Recorded before awaiting, so concurrent requests and failed fetches count too.
+    let recent_attempt = now - JWKS_ATTEMPT.get() < JWKS_MIN_REFRESH_MS;
+    if let Some(k) = cached_keys(team, |at, keys| {
+        recent_attempt || (now - at < JWKS_TTL_MS && has_kid(keys, kid))
+    }) {
+        return Ok(k);
+    }
+    if recent_attempt {
+        return Err(worker::Error::RustError(
+            "Access certs fetch failed recently; retrying shortly".into(),
+        ));
+    }
+    JWKS_ATTEMPT.set(now);
+    JWKS_FETCHING.set(true);
+    let res = fetch_jwks(team).await;
+    JWKS_FETCHING.set(false);
+    let keys = res?;
+    JWKS.with(|c| *c.borrow_mut() = Some((now, team.to_string(), keys.clone())));
+    Ok(keys)
+}
+
+async fn fetch_jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
     #[derive(Deserialize)]
     struct Jwks {
         keys: Vec<serde_json::Value>,
     }
     let url = format!("https://{team}/cdn-cgi/access/certs");
     let mut res = Fetch::Url(url.parse()?).send().await?;
-    let body: Jwks = res.json().await?;
-    JWKS.with(|c| *c.borrow_mut() = Some((now, team.to_string(), body.keys.clone())));
-    Ok(body.keys)
+    Ok(res.json::<Jwks>().await?.keys)
 }
 
 /// Pure claim checks, separated for unit testing.
@@ -153,9 +204,9 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
     let aud = var(env, "ACCESS_AUD");
 
     // Local development only (`.dev.vars`). Ignored as soon as Access is configured,
-    // so it can never open a deployed Worker.
+    // and only honoured on a loopback host, so it can never open a deployed Worker.
     let dev = var(env, "DEV_AUTH_EMAIL");
-    if !dev.is_empty() && aud.is_empty() && team.is_empty() {
+    if !dev.is_empty() && aud.is_empty() && team.is_empty() && is_local(req) {
         return Ok(Identity { email: dev });
     }
 
@@ -192,7 +243,7 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
     let sig =
         b64url_decode(parts[2]).ok_or_else(|| AuthError::Denied("bad token signature".into()))?;
 
-    let keys = jwks(&team)
+    let keys = jwks(&team, header.kid.as_deref())
         .await
         .map_err(|e| AuthError::Denied(format!("could not fetch Access certs: {e}")))?;
     let candidates: Vec<&serde_json::Value> = keys
@@ -214,8 +265,13 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
         }
     }
     if !valid {
-        // Keys may have rotated: drop the cache so the next request refetches.
-        JWKS.with(|c| *c.borrow_mut() = None);
+        // Keys may have rotated under a token without a `kid`: expire the cache so the
+        // next request refetches (still subject to the attempt limit in `jwks`).
+        JWKS.with(|c| {
+            if let Some((at, _, _)) = c.borrow_mut().as_mut() {
+                *at = 0;
+            }
+        });
         return Err(AuthError::Denied("invalid token signature".into()));
     }
     check_claims(
