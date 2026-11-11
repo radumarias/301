@@ -224,36 +224,49 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             }
             let c: Claim = body!(req);
             let moved = account::claim_anonymous(&env, who.user_id, &c.tokens).await?;
-            json(&serde_json::json!({ "claimed": moved }), 200)
+            // Anonymous links have no aliases: forgetting the slug refreshes the record.
+            let slugs: Vec<&str> = moved.iter().map(String::as_str).collect();
+            if let Err(e) = store::forget_kv(&env, &slugs).await {
+                return store_err(e);
+            }
+            json(&serde_json::json!({ "claimed": moved.len() }), 200)
         }
 
         (Method::Get, ["links"], _) => list_links(&env, &query, &who).await,
         (Method::Post, ["links"], _) => {
             let input: LinkInput = body!(req);
             let st = store::settings(&env).await.unwrap_or_default();
-            if let Some(uid) = scope {
-                let made = account::created_since(&env, Some(uid), None, now_ms() - DAY_MS).await?;
-                if made >= st.user_per_day {
-                    return json_error(
-                        format!(
-                            "You can create {} links a day. Try again tomorrow.",
-                            st.user_per_day
-                        ),
-                        429,
-                    );
-                }
-            }
-            let mut link = match store::new_link(&env, &st, &input, "manual").await {
-                Ok(l) => l,
-                Err(e) => return store_err(e),
+            let reservation = match scope {
+                Some(uid) => match account::reserve_creation(
+                    &env,
+                    account::Creator::User(uid),
+                    now_ms() - DAY_MS,
+                    st.user_per_day,
+                )
+                .await?
+                {
+                    Some(r) => Some(r),
+                    None => {
+                        return json_error(
+                            format!(
+                                "You can create {} links a day. Try again tomorrow.",
+                                st.user_per_day
+                            ),
+                            429,
+                        )
+                    }
+                },
+                None => None,
             };
-            if scope.is_some() {
-                if let Err(r) = check_destinations(&env, &req, &link).await {
-                    return Ok(r);
-                }
+            let res = create_link(&env, &req, &st, &input, &who, scope.is_some()).await;
+            if let (Some(r), Err(_) | Ok(Err(_))) = (reservation, &res) {
+                account::release_creation(&env, r).await?;
             }
-            link.owner_id = Some(who.user_id);
-            respond(store::insert_link(&env, link, true).await, 201)
+            match res {
+                Ok(Ok(link)) => json(&link, 201),
+                Ok(Err(r)) => Ok(r),
+                Err(e) => store_err(e),
+            }
         }
         (Method::Post, ["links", "bulk"], _) => {
             let b: Bulk = body!(req);
@@ -620,6 +633,9 @@ async fn bulk(env: &Env, body: Bulk, who: &Identity) -> Result<Response> {
     }
     if !stmts.is_empty() {
         store::db(env)?.batch(stmts).await?;
+        if let Err(e) = store::refresh_blocked(env, &mut updated).await {
+            return store_err(e);
+        }
     }
     for r in futures_util::future::join_all(updated.iter().map(|l| store::sync_kv(env, l))).await {
         if let Err(e) = r {
@@ -630,6 +646,25 @@ async fn bulk(env: &Env, body: Bulk, who: &Identity) -> Result<Response> {
         &serde_json::json!({ "done": updated.len(), "errors": errors }),
         200,
     )
+}
+
+/// Builds, checks and saves a new link. `Ok(Err(response))` is a refusal (unsafe URL).
+async fn create_link(
+    env: &Env,
+    req: &Request,
+    st: &store::Settings,
+    input: &LinkInput,
+    who: &Identity,
+    check: bool,
+) -> SResult<std::result::Result<Link, Response>> {
+    let mut link = store::new_link(env, st, input, "manual").await?;
+    if check {
+        if let Err(r) = check_destinations(env, req, &link).await {
+            return Ok(Err(r));
+        }
+    }
+    link.owner_id = Some(who.user_id);
+    store::insert_link(env, link, true).await.map(Ok)
 }
 
 // ---- Stats ----

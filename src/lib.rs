@@ -33,6 +33,9 @@ async fn scheduled(_ev: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         Ok(n) => worker::console_log!("click retention: deleted {n} old click events"),
         Err(e) => worker::console_error!("click retention failed: {e}"),
     }
+    if let Err(e) = account::purge_creations(&env).await {
+        worker::console_error!("creation records purge failed: {e}");
+    }
 }
 
 #[event(fetch)]

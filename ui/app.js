@@ -956,16 +956,20 @@ async function claimDeviceLinks() {
   // The server takes at most 50 tokens per call: send them in chunks and only forget
   // the ones that were sent, so a failure keeps the rest for the next sign-in.
   let list = anonList();
+  const sent = [];
   let claimed = 0;
   try {
     while (list.length) {
-      const r = await api("POST", "/claim", { tokens: list.slice(0, 50).map((a) => a.token) });
+      const chunk = list.slice(0, 50).map((a) => a.token);
+      const r = await api("POST", "/claim", { tokens: chunk });
+      sent.push(...chunk);
       claimed += r.claimed || 0;
       list = list.slice(50);
       anonSave(list);
     }
   } catch {}
   if (claimed) toast(`Moved ${claimed} link${claimed === 1 ? "" : "s"} you made without an account to your account`);
+  return sent;
 }
 
 function applyTheme() {
@@ -981,7 +985,12 @@ async function boot() {
   ME = me.status === "fulfilled" ? me.value : null;
   if (me.status === "rejected" && [403, 503].includes(me.reason.status)) toast(me.reason.message, true);
   renderHeader();
-  if (ME) await claimDeviceLinks();
+  if (ME) {
+    // Signed in from a manage page: that token was just claimed, so show the account's links.
+    const sent = await claimDeviceLinks();
+    const m = location.hash.match(/^#\/m\/([^/?]+)/);
+    if (m && sent.includes(m[1])) history.replaceState(null, "", "#/links");
+  }
   render();
 }
 boot();

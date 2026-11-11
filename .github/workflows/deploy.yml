@@ -88,6 +88,9 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Provision KV, D1 and Cloudflare Access
+        env:
+          # Only checked for presence: Access is not removed while Google is half set up.
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: ./scripts/provision.sh
       - name: Apply D1 migrations
         run: npx wrangler d1 migrations apply DB --remote

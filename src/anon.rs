@@ -66,13 +66,19 @@ pub async fn create(mut req: Request, env: &Env) -> Result<Response> {
         );
     }
     let ip_hash = account::ip_hash(env, ip.as_deref().unwrap_or("local")).await?;
-    let made = account::created_since(env, None, Some(&ip_hash), now_ms() - HOUR_MS).await?;
-    if made >= st.anon_per_hour {
+    let Some(reservation) = account::reserve_creation(
+        env,
+        account::Creator::Ip(&ip_hash),
+        now_ms() - HOUR_MS,
+        st.anon_per_hour,
+    )
+    .await?
+    else {
         return json_error(
             "Too many links from your network in the last hour. Sign in, or try again later.",
             429,
         );
-    }
+    };
 
     // Only a destination and a slug style: no custom slug or other options.
     let input = LinkInput {
@@ -82,8 +88,12 @@ pub async fn create(mut req: Request, env: &Env) -> Result<Response> {
     };
     let mut link = match store::new_link(env, &st, &input, "anonymous").await {
         Ok(l) => l,
-        Err(e) => return json_error(e.public_message(), 400),
+        Err(e) => {
+            account::release_creation(env, reservation).await?;
+            return json_error(e.public_message(), 400);
+        }
     };
+    // An unsafe destination keeps its reservation: probing for allowed URLs costs quota.
     if let Err(e) = safety::check_link(env, &req, &link).await {
         return json_error(e, 400);
     }

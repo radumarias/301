@@ -401,15 +401,21 @@ pub fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatem
     .bind(&binds)
 }
 
-/// Ownership columns are not written here: see `claim_*` in `account`.
-pub fn update_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
+/// Ownership columns are not written here: see `claim_*` in `account`. `blocked` is only
+/// written for a moderation action (`block`), so an edit that loaded the link earlier can
+/// never undo a block made in the meantime.
+pub fn update_stmt(
+    db: &D1Database,
+    l: &Link,
+    block: Option<bool>,
+) -> worker::Result<D1PreparedStatement> {
     let mut binds = link_binds(l);
-    binds.push(b(l.blocked));
+    binds.push(block.map(b).unwrap_or(JsValue::NULL));
     binds.push(n(l.id));
     db.prepare(
         "UPDATE links SET slug = ?1, url = ?2, title = ?3, notes = ?4, tags = ?5, redirect_type = ?6, disabled = ?7, expires_at = ?8, \
          max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17, \
-         blocked = ?18 WHERE id = ?19",
+         blocked = COALESCE(?18, blocked) WHERE id = ?19",
     )
     .bind(&binds)
 }
@@ -490,15 +496,51 @@ pub async fn prepare_update(
         link.slug = new_slug;
     }
     link.updated_at = now_ms();
-    stmts.insert(0, update_stmt(&d, link)?);
+    stmts.insert(0, update_stmt(&d, link, input.blocked)?);
     Ok(stmts)
 }
 
 /// Runs the statements from `prepare_update` and refreshes the link's KV records.
-pub async fn save_update(env: &Env, link: Link, stmts: Vec<D1PreparedStatement>) -> SResult<Link> {
+pub async fn save_update(
+    env: &Env,
+    mut link: Link,
+    stmts: Vec<D1PreparedStatement>,
+) -> SResult<Link> {
     db(env)?.batch(stmts).await?;
+    refresh_blocked(env, std::slice::from_mut(&mut link)).await?;
     sync_kv(env, &link).await?;
     Ok(link.with_status())
+}
+
+/// Re-reads `blocked` after an update, so the KV record written next carries a block an
+/// admin made while the edit was in progress.
+pub async fn refresh_blocked(env: &Env, links: &mut [Link]) -> SResult<()> {
+    #[derive(Deserialize)]
+    struct Row {
+        id: i64,
+        blocked: i64,
+    }
+    let d = db(env)?;
+    for chunk in links.chunks_mut(90) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
+        let rows = d
+            .prepare(format!(
+                "SELECT id, blocked FROM links WHERE id IN ({marks})"
+            ))
+            .bind(&ids)?
+            .all()
+            .await?
+            .results::<Row>()?;
+        let blocked: HashMap<i64, bool> =
+            rows.into_iter().map(|r| (r.id, r.blocked != 0)).collect();
+        for l in chunk {
+            if let Some(&b) = blocked.get(&l.id) {
+                l.blocked = b;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Owner and blocked flag of a link, without loading the whole row.

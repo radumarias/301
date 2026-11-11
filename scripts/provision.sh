@@ -67,6 +67,12 @@ fi
 echo "   $(awk -F, '{print NF}' <<<"$ADMIN_EMAILS") address(es)"
 
 if [[ -n "${GOOGLE_CLIENT_ID:-}" ]]; then
+  # Deleting Access with Google half set up would leave nobody able to sign in.
+  if [[ -z "${GOOGLE_CLIENT_SECRET:-}" ]]; then
+    echo "error: GOOGLE_CLIENT_ID is set but the GOOGLE_CLIENT_SECRET secret is missing." >&2
+    echo "       Add it, or remove GOOGLE_CLIENT_ID to keep Cloudflare Access." >&2
+    exit 1
+  fi
   echo "== Google sign-in configured: Cloudflare Access is not used"
   APP_ID=$(cf GET "$ACC/access/apps?per_page=100" | jq -r --arg n "$APP_NAME" '[.result[] | select(.name==$n)][0].id // empty') || APP_ID=""
   if [[ -n "$APP_ID" ]]; then

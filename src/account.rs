@@ -198,53 +198,91 @@ pub async fn claim_legacy_links(env: &Env, admin_id: i64) -> worker::Result<()> 
     Ok(())
 }
 
-/// Moves anonymous links (by their manage tokens) to an account. Returns how many moved.
-pub async fn claim_anonymous(env: &Env, user_id: i64, tokens: &[String]) -> worker::Result<i64> {
+/// Moves anonymous links (by their manage tokens) to an account, where they no longer
+/// expire. Returns the slugs that moved (their KV records are stale now).
+pub async fn claim_anonymous(
+    env: &Env,
+    user_id: i64,
+    tokens: &[String],
+) -> worker::Result<Vec<String>> {
     let d = db(env)?;
     let mut stmts = vec![];
     for t in tokens.iter().take(50) {
         stmts.push(
             d.prepare(
-                "UPDATE links SET owner_id = ?1, manage_hash = NULL, creator_ip = NULL WHERE manage_hash = ?2",
+                "UPDATE links SET owner_id = ?1, manage_hash = NULL, creator_ip = NULL, expires_at = NULL \
+                 WHERE manage_hash = ?2 RETURNING slug",
             )
             .bind(&[n(user_id), s(&token_hash(t).await?)])?,
         );
     }
     if stmts.is_empty() {
-        return Ok(0);
+        return Ok(vec![]);
     }
-    let mut moved = 0;
+    #[derive(Deserialize)]
+    struct Slug {
+        slug: String,
+    }
+    let mut moved = vec![];
     for r in d.batch(stmts).await? {
-        moved += r.meta()?.and_then(|m| m.changes).unwrap_or(0) as i64;
+        moved.extend(r.results::<Slug>()?.into_iter().map(|r| r.slug));
     }
     Ok(moved)
 }
 
-/// Links created since `since` by an owner or (anonymous) by an IP hash.
-pub async fn created_since(
+/// Who a creation counts against: an account, or (anonymous) an IP hash.
+pub enum Creator<'a> {
+    User(i64),
+    Ip(&'a str),
+}
+
+/// Reserves one creation if fewer than `limit` were made since `since`. The check and the
+/// insert are one statement, so parallel requests cannot both take the last slot.
+/// Returns the reservation id (to release it if the link is not saved after all).
+pub async fn reserve_creation(
     env: &Env,
-    owner_id: Option<i64>,
-    ip: Option<&str>,
+    who: Creator<'_>,
     since: i64,
-) -> worker::Result<i64> {
-    let (sql, binds) = match (owner_id, ip) {
-        (Some(o), _) => (
-            "SELECT COUNT(*) AS n FROM links WHERE owner_id = ?1 AND created_at >= ?2",
-            vec![n(o), n(since)],
-        ),
-        (None, Some(ip)) => (
-            "SELECT COUNT(*) AS n FROM links WHERE creator_ip = ?1 AND created_at >= ?2",
-            vec![s(ip), n(since)],
-        ),
-        _ => return Ok(0),
+    limit: i64,
+) -> worker::Result<Option<i64>> {
+    let (col, key) = match who {
+        Creator::User(o) => ("owner_id", n(o)),
+        Creator::Ip(ip) => ("ip", s(ip)),
     };
+    #[derive(Deserialize)]
+    struct Id {
+        id: i64,
+    }
+    let sql = format!(
+        "INSERT INTO creations ({col}, created_at) SELECT ?1, ?2 \
+         WHERE (SELECT COUNT(*) FROM creations WHERE {col} = ?1 AND created_at >= ?3) < ?4 RETURNING id"
+    );
     Ok(db(env)?
         .prepare(sql)
-        .bind(&binds)?
-        .first::<CountRow>(None)
+        .bind(&[key, n(now_ms()), n(since), n(limit)])?
+        .first::<Id>(None)
         .await?
-        .map(|c| c.n)
-        .unwrap_or(0))
+        .map(|r| r.id))
+}
+
+/// Gives back a reservation whose link was not saved (invalid input, taken slug, ...).
+pub async fn release_creation(env: &Env, id: i64) -> worker::Result<()> {
+    db(env)?
+        .prepare("DELETE FROM creations WHERE id = ?1")
+        .bind(&[n(id)])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Drops creation records older than any limit window (two days).
+pub async fn purge_creations(env: &Env) -> worker::Result<()> {
+    db(env)?
+        .prepare("DELETE FROM creations WHERE created_at < ?1")
+        .bind(&[n(now_ms() - 2 * 86_400_000)])?
+        .run()
+        .await?;
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
