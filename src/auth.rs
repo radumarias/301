@@ -51,6 +51,8 @@ pub struct Claims {
 
 thread_local! {
     static JWKS: RefCell<Option<(i64, String, Vec<serde_json::Value>)>> = const { RefCell::new(None) };
+    /// When this isolate last started a certs fetch (successful or not).
+    static JWKS_ATTEMPT: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 fn list(v: &str) -> Vec<String> {
@@ -78,8 +80,9 @@ fn is_local(req: &Request) -> bool {
 }
 
 const JWKS_TTL_MS: i64 = 3_600_000;
-/// An unknown `kid` (key rotation) refetches early, but at most this often, so forged
-/// tokens cannot turn every request into a fetch of the Access certs.
+/// An unknown `kid` or a failed signature (key rotation) refetches early, but fetch
+/// attempts, successful or not, start at most this often per isolate, so forged tokens
+/// cannot turn requests into fetches of the Access certs.
 const JWKS_MIN_REFRESH_MS: i64 = 60_000;
 
 fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
@@ -91,18 +94,25 @@ fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
 
 async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
     let now = now_ms();
+    // Recorded before awaiting, so concurrent requests and failed fetches count too.
+    let recent_attempt = now - JWKS_ATTEMPT.get() < JWKS_MIN_REFRESH_MS;
     let cached = JWKS.with(|c| {
         c.borrow()
             .as_ref()
             .filter(|(at, t, keys)| {
-                let age = now - at;
-                t == team && age < JWKS_TTL_MS && (age < JWKS_MIN_REFRESH_MS || has_kid(keys, kid))
+                t == team && (recent_attempt || (now - at < JWKS_TTL_MS && has_kid(keys, kid)))
             })
             .map(|(_, _, k)| k.clone())
     });
     if let Some(k) = cached {
         return Ok(k);
     }
+    if recent_attempt {
+        return Err(worker::Error::RustError(
+            "Access certs fetch failed recently; retrying shortly".into(),
+        ));
+    }
+    JWKS_ATTEMPT.set(now);
     #[derive(Deserialize)]
     struct Jwks {
         keys: Vec<serde_json::Value>,
@@ -226,15 +236,11 @@ pub async fn verify(req: &Request, env: &Env) -> Result<Identity, AuthError> {
         }
     }
     if !valid {
-        // Keys may have rotated under a token without a `kid` (which never triggers the
-        // early refetch): drop a cache older than the minimum refresh interval.
-        let now = now_ms();
+        // Keys may have rotated under a token without a `kid`: expire the cache so the
+        // next request refetches (still subject to the attempt limit in `jwks`).
         JWKS.with(|c| {
-            let mut c = c.borrow_mut();
-            if c.as_ref()
-                .is_some_and(|(at, _, _)| now - at >= JWKS_MIN_REFRESH_MS)
-            {
-                *c = None;
+            if let Some((at, _, _)) = c.borrow_mut().as_mut() {
+                *at = 0;
             }
         });
         return Err(AuthError::Denied("invalid token signature".into()));

@@ -5,17 +5,17 @@ compatibility_date = "2026-10-01"
 # workers_dev = false, add routes = [{ pattern = "301.xorio.rs", custom_domain = true }]
 # and the DOMAIN repo variable.
 workers_dev = true
+# Version preview URLs would expose the Worker on extra hosts outside the Access app.
+preview_urls = false
 
 [build]
 command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
 watch_dir = ["src", "ui", "migrations"]
 
-# Version preview URLs would expose the Worker on extra hosts outside the Access app.
-preview_urls = false
-
-# Daily click-retention purge (Settings -> Click retention).
+# Hourly click-retention purge (Settings -> Keep click details for). Each run deletes
+# up to 100k expired rows, so a backlog drains within a few hours.
 [triggers]
-crons = ["23 3 * * *"]
+crons = ["23 * * * *"]
 
 [observability]
 enabled = true

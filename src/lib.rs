@@ -21,7 +21,7 @@ mod ui;
 
 use worker::{event, Context, Env, Request, Response, Result, ScheduleContext, ScheduledEvent};
 
-/// Daily cron (see `[triggers]` in wrangler.toml): enforces click retention.
+/// Hourly cron (see `[triggers]` in wrangler.toml): enforces click retention.
 #[event(scheduled)]
 async fn scheduled(_ev: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     match store::purge_old_clicks(&env).await {

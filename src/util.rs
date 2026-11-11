@@ -128,8 +128,8 @@ pub fn redirect(location: &str, status: u16) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Location", &header_safe_url(location))?;
     headers.set("Cache-Control", "private, max-age=0")?;
-    // The browser default: the destination sees only the origin of the page the link
-    // was clicked on, never its full URL.
+    // The browser default: a cross-origin destination sees only the origin of the page
+    // the link was clicked on, not its path or query (same-origin requests keep it).
     headers.set("Referrer-Policy", "strict-origin-when-cross-origin")?;
     headers.set("X-Robots-Tag", "noindex")?;
     Ok(Response::empty()?.with_status(status).with_headers(headers))

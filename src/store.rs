@@ -112,7 +112,7 @@ pub struct Settings {
     pub default_redirect: u16,
     pub default_slug_style: String,
     pub default_slug_length: usize,
-    /// Click events older than this are deleted by the daily cron (0 keeps them forever).
+    /// Click events older than this are deleted by the hourly cron (0 keeps them forever).
     /// Per-link click totals are kept.
     pub click_retention_days: u32,
 }
