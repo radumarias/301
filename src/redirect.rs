@@ -20,7 +20,44 @@ fn referrer_host(req: &Request) -> Option<String> {
         .map(|h| h.trim_start_matches("www.").to_string())
 }
 
+/// Name of the Workers Rate Limiting binding in wrangler.toml (`[[ratelimits]]`).
+const LIMITER: &str = "REDIRECT_LIMITER";
+
+/// Seconds a client is told to wait after a 429; matches the binding's `period`.
+const RETRY_AFTER_SECS: u32 = 60;
+
+/// The key the limiter counts against: the visitor's IP as seen by Cloudflare.
+fn client_key(req: &Request) -> Option<String> {
+    req.headers()
+        .get("CF-Connecting-IP")
+        .ok()
+        .flatten()
+        .filter(|ip| !ip.is_empty())
+}
+
+/// True when this visitor is over the per-IP limit. Fails open: a missing binding or a
+/// limiter error never blocks a redirect.
+async fn over_limit(req: &Request, env: &Env) -> bool {
+    let Some(key) = client_key(req) else {
+        return false;
+    };
+    let Ok(limiter) = env.rate_limiter(LIMITER) else {
+        return false;
+    };
+    match limiter.limit(key).await {
+        Ok(outcome) => !outcome.success,
+        Err(e) => {
+            worker::console_error!("rate limiter failed: {e}");
+            false
+        }
+    }
+}
+
 pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
+    if over_limit(&req, &env).await {
+        return pages::too_many_requests(RETRY_AFTER_SECS);
+    }
+
     let slug = decode_path(&req.path());
 
     match slug.as_str() {
