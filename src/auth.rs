@@ -53,6 +53,8 @@ thread_local! {
     static JWKS: RefCell<Option<(i64, String, Vec<serde_json::Value>)>> = const { RefCell::new(None) };
     /// When this isolate last started a certs fetch (successful or not).
     static JWKS_ATTEMPT: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// True while a certs fetch is in flight; concurrent requests wait for it.
+    static JWKS_FETCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn list(v: &str) -> Vec<String> {
@@ -92,19 +94,32 @@ fn has_kid(keys: &[serde_json::Value], kid: Option<&str>) -> bool {
     })
 }
 
+fn cached_keys(
+    team: &str,
+    ok: impl Fn(i64, &[serde_json::Value]) -> bool,
+) -> Option<Vec<serde_json::Value>> {
+    JWKS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(at, t, keys)| t == team && ok(*at, keys))
+            .map(|(_, _, k)| k.clone())
+    })
+}
+
 async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::Value>> {
+    // Another request in this isolate is fetching: wait for its result instead of
+    // failing or starting a second fetch (the admin UI sends requests in parallel).
+    let mut waited = 0;
+    while JWKS_FETCHING.get() && waited < 10_000 {
+        worker::Delay::from(std::time::Duration::from_millis(25)).await;
+        waited += 25;
+    }
     let now = now_ms();
     // Recorded before awaiting, so concurrent requests and failed fetches count too.
     let recent_attempt = now - JWKS_ATTEMPT.get() < JWKS_MIN_REFRESH_MS;
-    let cached = JWKS.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|(at, t, keys)| {
-                t == team && (recent_attempt || (now - at < JWKS_TTL_MS && has_kid(keys, kid)))
-            })
-            .map(|(_, _, k)| k.clone())
-    });
-    if let Some(k) = cached {
+    if let Some(k) = cached_keys(team, |at, keys| {
+        recent_attempt || (now - at < JWKS_TTL_MS && has_kid(keys, kid))
+    }) {
         return Ok(k);
     }
     if recent_attempt {
@@ -113,15 +128,22 @@ async fn jwks(team: &str, kid: Option<&str>) -> worker::Result<Vec<serde_json::V
         ));
     }
     JWKS_ATTEMPT.set(now);
+    JWKS_FETCHING.set(true);
+    let res = fetch_jwks(team).await;
+    JWKS_FETCHING.set(false);
+    let keys = res?;
+    JWKS.with(|c| *c.borrow_mut() = Some((now, team.to_string(), keys.clone())));
+    Ok(keys)
+}
+
+async fn fetch_jwks(team: &str) -> worker::Result<Vec<serde_json::Value>> {
     #[derive(Deserialize)]
     struct Jwks {
         keys: Vec<serde_json::Value>,
     }
     let url = format!("https://{team}/cdn-cgi/access/certs");
     let mut res = Fetch::Url(url.parse()?).send().await?;
-    let body: Jwks = res.json().await?;
-    JWKS.with(|c| *c.borrow_mut() = Some((now, team.to_string(), body.keys.clone())));
-    Ok(body.keys)
+    Ok(res.json::<Jwks>().await?.keys)
 }
 
 /// Pure claim checks, separated for unit testing.
