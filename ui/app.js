@@ -946,8 +946,13 @@ function showFeatures() {
     document.removeEventListener("keydown", onKey, true);
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     root.remove();
+    for (const el of behind) el.inert = false;
     document.body.style.overflow = "";
+    document.getElementById("features").focus();
   }
+  // Keep keyboard focus inside the tour: everything behind it is inert while it is open.
+  const behind = [...document.body.children].filter((el) => !el.inert);
+  for (const el of behind) el.inert = true;
   document.addEventListener("keydown", onKey, true);
   document.body.style.overflow = "hidden";
   document.body.append(root);

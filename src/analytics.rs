@@ -22,6 +22,9 @@ pub const DEFAULT_DATASET: &str = "xorio_301_clicks";
 const ROLLUP_CURSOR: &str = "ae_rollup_cursor";
 /// Analytics Engine ingests within seconds; stay this far behind "now" when rolling up.
 const ROLLUP_LAG_SECS: i64 = 120;
+/// SQL condition (bound at ?4) that the rollup cursor still holds the value a run read.
+const CURSOR_IS: &str =
+    "COALESCE((SELECT value FROM settings WHERE key = 'ae_rollup_cursor'), '0') = ?4";
 
 pub struct Config {
     pub account: String,
@@ -175,13 +178,13 @@ pub fn stats_sql(
             ""
         };
         q.push(format!(
-            "SELECT {col} AS k, SUM(_sample_interval) AS n FROM {ds} WHERE {f} AND double1 = 0{extra} GROUP BY k ORDER BY n DESC LIMIT 10"
+            "SELECT {col} AS k, SUM(_sample_interval) AS n FROM {ds} WHERE {f} AND double1 = 0{extra} GROUP BY k ORDER BY n DESC LIMIT 50"
         ));
     }
     if link.is_none() {
         q.push(format!(
-            // 20, not 10: ids of deleted links (AE rows cannot be deleted) are dropped later.
-            "SELECT index1 AS k, SUM(_sample_interval) AS n FROM {ds} WHERE {f} AND double1 = 0 GROUP BY k ORDER BY n DESC LIMIT 20"
+            // Over-fetched: ids of deleted links (AE rows cannot be deleted) are dropped later.
+            "SELECT index1 AS k, SUM(_sample_interval) AS n FROM {ds} WHERE {f} AND double1 = 0 GROUP BY k ORDER BY n DESC LIMIT 60"
         ));
     }
     q
@@ -217,17 +220,26 @@ pub async fn rollup(env: &Env) -> worker::Result<usize> {
             continue;
         };
         stmts.push(
-            d.prepare("UPDATE links SET clicks = clicks + ?2, last_click_at = MAX(COALESCE(last_click_at, 0), ?3) WHERE id = ?1")
-                .bind(&[store::n(id), store::n(num(r.get("n"))), store::n(num(r.get("last")) * 1000)])?,
+            // Only while the cursor is still where this run read it: an overlapping run that
+            // already moved it makes these updates no-ops instead of double counts.
+            d.prepare(format!("UPDATE links SET clicks = clicks + ?2, last_click_at = MAX(COALESCE(last_click_at, 0), ?3) WHERE id = ?1 AND {CURSOR_IS}"))
+                .bind(&[store::n(id), store::n(num(r.get("n"))), store::n(num(r.get("last")) * 1000), store::s(&from.to_string())])?,
         );
     }
     let updated = stmts.len();
     // Counts and the cursor move together, so a failed run is simply retried.
-    stmts.push(store::set_state_stmt(
-        &d,
-        ROLLUP_CURSOR,
-        &until.to_string(),
-    )?);
+    stmts.push(
+        d.prepare(format!(
+            "INSERT INTO settings (key, value) SELECT ?1, ?2 WHERE {CURSOR_IS} \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        ))
+        .bind(&[
+            store::s(ROLLUP_CURSOR),
+            store::s(&until.to_string()),
+            store::n(0),
+            store::s(&from.to_string()),
+        ])?,
+    );
     d.batch(stmts).await?;
     Ok(updated)
 }

@@ -112,7 +112,8 @@ jobs:
       PRIVACY_CONTACT: ${{ vars.PRIVACY_CONTACT }}
       # Staging is a full second copy with its own Worker, KV, D1, R2 and Access app,
       # served on xorio-301-staging.<subdomain>.workers.dev.
-      DOMAIN: ${{ inputs.target == 'staging' && vars.STAGING_DOMAIN || vars.DOMAIN }}
+      # Staging never falls back to the production DOMAIN: without STAGING_DOMAIN it stays on workers.dev.
+      DOMAIN: ${{ inputs.target != 'staging' && vars.DOMAIN || inputs.target == 'staging' && vars.STAGING_DOMAIN || '' }}
       WORKER_NAME: ${{ inputs.target == 'staging' && 'xorio-301-staging' || 'xorio-301' }}
       KV_TITLE: ${{ inputs.target == 'staging' && 'xorio-301-staging-links' || 'xorio-301-links' }}
       D1_NAME: ${{ inputs.target == 'staging' && 'xorio-301-staging' || 'xorio-301' }}

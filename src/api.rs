@@ -576,7 +576,7 @@ async fn d1_stats(env: &Env, link: Option<i64>, since: i64, bucket: i64) -> Resu
         };
         stmts.push(
             d.prepare(format!(
-                "SELECT {expr} AS k, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0{extra} GROUP BY k ORDER BY n DESC LIMIT 10"
+                "SELECT {expr} AS k, COUNT(*) AS n FROM clicks WHERE {filter} AND bot = 0{extra} GROUP BY k ORDER BY n DESC LIMIT 50"
             ))
             .bind(&binds)?,
         );
@@ -584,7 +584,7 @@ async fn d1_stats(env: &Env, link: Option<i64>, since: i64, bucket: i64) -> Resu
     if link.is_none() {
         stmts.push(
             d.prepare(
-                "SELECT CAST(link_id AS TEXT) AS k, COUNT(*) AS n FROM clicks WHERE ts >= ?1 AND bot = 0 GROUP BY link_id ORDER BY n DESC LIMIT 10",
+                "SELECT CAST(link_id AS TEXT) AS k, COUNT(*) AS n FROM clicks WHERE ts >= ?1 AND bot = 0 GROUP BY link_id ORDER BY n DESC LIMIT 50",
             )
             .bind(&binds)?,
         );

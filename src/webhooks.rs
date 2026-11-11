@@ -227,7 +227,11 @@ pub async fn fire_click(env: &Env, click: &crate::store::Click) {
         .into_iter()
         .filter(|o| o.2.is_some() || hooks.iter().any(|h| h.id == o.0 && h.last_error.is_some()))
         .collect();
-    let _ = record(env, &failed).await;
+    if !failed.is_empty() {
+        let _ = record(env, &failed).await;
+        // The stored error state changed: reload it so the next success is not dropped.
+        invalidate();
+    }
 }
 
 #[cfg(test)]

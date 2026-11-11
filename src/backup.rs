@@ -58,13 +58,27 @@ pub struct BackupInfo {
 pub async fn run(env: &Env) -> worker::Result<String> {
     let bucket = env.bucket(BINDING)?;
     let now = now_ms();
-    let (links, aliases, settings, webhooks) = futures_util::future::try_join4(
+    let (links, settings, webhooks) = futures_util::future::try_join3(
         dump(env, "links", "id"),
-        dump(env, "aliases", "slug"),
         dump(env, "settings", "key"),
         dump(env, "webhooks", "id"),
     )
     .await?;
+    // Aliases are read after links, and any whose link is not in this backup (created or
+    // deleted while it ran) are left out, so a restore never has dangling references.
+    let ids: std::collections::HashSet<i64> = links
+        .iter()
+        .filter_map(|l| l.get("id").and_then(Value::as_i64))
+        .collect();
+    let aliases: Vec<Value> = dump(env, "aliases", "slug")
+        .await?
+        .into_iter()
+        .filter(|a| {
+            a.get("link_id")
+                .and_then(Value::as_i64)
+                .is_some_and(|id| ids.contains(&id))
+        })
+        .collect();
     let body = serde_json::json!({
         "format": "xorio-301-backup",
         "version": 1,

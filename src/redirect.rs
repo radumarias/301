@@ -227,7 +227,8 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
     );
 
     // Phones with an app link try the app first and fall back to the web destination.
-    if is_get && !bot {
+    // A POST only gets this far after the right password, so it opens the app too.
+    if (is_get || rec.pw.is_some()) && !bot {
         if let Some(app) = rec.app.for_os(info.os) {
             return pages::open_app(app, &dest);
         }
