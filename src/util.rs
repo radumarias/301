@@ -135,6 +135,27 @@ pub fn redirect(location: &str, status: u16) -> Result<Response> {
     Ok(Response::empty()?.with_status(status).with_headers(headers))
 }
 
+/// `fetch` with a deadline (Workers has no default timeout for subrequests).
+pub async fn fetch_with_timeout(req: worker::Request, ms: u64) -> Result<Response> {
+    use futures_util::future::{select, Either};
+    let fetch = Box::pin(async move { worker::Fetch::Request(req).send().await });
+    let timeout = Box::pin(worker::Delay::from(std::time::Duration::from_millis(ms)));
+    match select(fetch, timeout).await {
+        Either::Left((res, _)) => res,
+        Either::Right(_) => Err(worker::Error::RustError(format!("timed out after {ms} ms"))),
+    }
+}
+
+/// First 300 characters of an error message, for storing and showing.
+pub fn snippet(s: &str) -> String {
+    s.chars().take(300).collect()
+}
+
+/// Lowercase hex of some bytes.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Escapes text for safe inclusion in HTML.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

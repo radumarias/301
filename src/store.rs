@@ -14,7 +14,7 @@ use worker::{D1Database, D1PreparedStatement, Env, KvStore};
 
 pub const KV_CACHE_TTL: u64 = 60;
 
-pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at";
+pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, og, variants, app, health_code, health_error, health_checked_at, source, clicks, last_click_at, created_at, updated_at";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -115,6 +115,8 @@ pub struct Settings {
     /// Click events older than this are deleted by the hourly cron (0 keeps them forever).
     /// Per-link click totals are kept.
     pub click_retention_days: u32,
+    /// Nightly R2 backups older than this are deleted.
+    pub backup_keep_days: u32,
 }
 
 /// Default retention for click events: 13 months.
@@ -129,6 +131,7 @@ impl Default for Settings {
             default_slug_style: "random".into(),
             default_slug_length: 7,
             click_retention_days: DEFAULT_CLICK_RETENTION_DAYS,
+            backup_keep_days: 30,
         }
     }
 }
@@ -146,6 +149,9 @@ impl Settings {
             return Err(
                 "click_retention_days must be at most 3650 (0 keeps clicks forever)".into(),
             );
+        }
+        if !(1..=3650).contains(&self.backup_keep_days) {
+            return Err("backups must be kept between 1 and 3650 days".into());
         }
         Ok(())
     }
@@ -338,7 +344,7 @@ async fn apply_password(link: &mut Link, input: &LinkInput) -> SResult<()> {
     Ok(())
 }
 
-/// The 17 column values shared by INSERT and UPDATE, as ?1..?17.
+/// The 20 column values shared by INSERT and UPDATE, as ?1..?20.
 fn link_binds(l: &Link) -> Vec<JsValue> {
     vec![
         s(&l.slug),
@@ -356,6 +362,9 @@ fn link_binds(l: &Link) -> Vec<JsValue> {
         json_or_null(&l.utm, l.utm.is_empty()),
         json_or_null(&l.geo, l.geo.is_empty()),
         json_or_null(&l.device, l.device.is_empty()),
+        json_or_null(&l.og, l.og.is_empty()),
+        json_or_null(&l.variants, l.variants.is_empty()),
+        json_or_null(&l.app, l.app.is_empty()),
         s(&l.source),
         n(l.updated_at),
     ]
@@ -365,8 +374,8 @@ pub fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatem
     let mut binds = link_binds(l);
     binds.push(n(l.created_at));
     db.prepare(
-        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING id",
+        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, og, variants, app, source, updated_at, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21) RETURNING id",
     )
     .bind(&binds)
 }
@@ -376,8 +385,8 @@ pub fn update_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatem
     binds.push(n(l.id));
     db.prepare(
         "UPDATE links SET slug = ?1, url = ?2, title = ?3, notes = ?4, tags = ?5, redirect_type = ?6, disabled = ?7, expires_at = ?8, \
-         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, source = ?16, updated_at = ?17 \
-         WHERE id = ?18",
+         max_clicks = ?9, fallback_url = ?10, password_hash = ?11, passthrough = ?12, utm = ?13, geo = ?14, device = ?15, og = ?16, variants = ?17, app = ?18, \
+         source = ?19, updated_at = ?20 WHERE id = ?21",
     )
     .bind(&binds)
 }
@@ -425,10 +434,19 @@ pub async fn prepare_update(
     input: &LinkInput,
 ) -> SResult<Vec<D1PreparedStatement>> {
     let old_slug = link.slug.clone();
+    let old_url = link.url.clone();
     input.apply(link).map_err(StoreError::Bad)?;
     apply_password(link, input).await?;
     let d = db(env)?;
     let mut stmts = vec![];
+    if link.url != old_url {
+        // A new destination gets checked again on the next checker run.
+        stmts.push(
+            d.prepare("UPDATE links SET health_code = NULL, health_error = NULL, health_checked_at = NULL WHERE id = ?1")
+                .bind(&[n(link.id)])?,
+        );
+        link.health = None;
+    }
 
     if let Some(requested) = input
         .slug
@@ -497,9 +515,11 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
     forget_kv(env, &slugs).await
 }
 
-pub async fn delete_link(env: &Env, id: i64) -> SResult<()> {
+/// Deletes one link and returns it (for webhooks).
+pub async fn delete_link(env: &Env, id: i64) -> SResult<Link> {
     let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
-    delete_links(env, &[link]).await
+    delete_links(env, std::slice::from_ref(&link)).await?;
+    Ok(link)
 }
 
 pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {
@@ -574,31 +594,67 @@ pub async fn fill_kv(env: &Env, slug: &str, rec: &KvRecord) -> SResult<()> {
     Ok(())
 }
 
-pub async fn click_count(env: &Env, id: i64) -> worker::Result<i64> {
+/// Outcome of counting a human click on a link with `max_clicks`.
+pub enum Consume {
+    /// Counted; `last` is true when this click used up the limit.
+    Counted { last: bool },
+    /// The limit was already reached; the click was not counted.
+    Exhausted,
+}
+
+/// Atomically counts one click against `max_clicks` (no read-then-write race), so
+/// concurrent visitors can never go past the limit.
+pub async fn consume_click(env: &Env, id: i64, ts: i64) -> worker::Result<Consume> {
     #[derive(Deserialize)]
     struct Row {
         clicks: i64,
+        max_clicks: Option<i64>,
     }
-    Ok(db(env)?
-        .prepare("SELECT clicks FROM links WHERE id = ?1")
-        .bind(&[n(id)])?
+    let row = db(env)?
+        .prepare(
+            "UPDATE links SET clicks = clicks + 1, last_click_at = ?2 \
+             WHERE id = ?1 AND (max_clicks IS NULL OR clicks < max_clicks) RETURNING clicks, max_clicks",
+        )
+        .bind(&[n(id), n(ts)])?
         .first::<Row>(None)
-        .await?
-        .map(|r| r.clicks)
-        .unwrap_or(0))
+        .await?;
+    Ok(match row {
+        Some(r) => Consume::Counted {
+            last: r.max_clicks.is_some_and(|m| r.clicks >= m),
+        },
+        None => Consume::Exhausted,
+    })
 }
 
-pub struct Click<'a> {
+/// Rewrites a link's KV records from D1 (e.g. after its click limit was reached).
+pub async fn resync(env: &Env, id: i64) -> SResult<()> {
+    match get_link(env, id).await? {
+        Some(l) => sync_kv(env, &l).await,
+        None => Ok(()),
+    }
+}
+
+#[derive(Serialize)]
+pub struct Click {
+    #[serde(skip)]
     pub link_id: i64,
+    #[serde(skip)]
+    pub slug: String,
     pub ts: i64,
     pub country: Option<String>,
     pub city: Option<String>,
     pub referrer: Option<String>,
-    pub device: &'a str,
-    pub os: &'a str,
-    pub browser: &'a str,
+    pub device: &'static str,
+    pub os: &'static str,
+    pub browser: &'static str,
+    #[serde(skip)]
     pub bot: bool,
     pub qr: bool,
+    /// Destination the A/B split picked, when the link has a split.
+    pub variant: Option<String>,
+    /// Already added to `links.clicks` by `consume_click`.
+    #[serde(skip)]
+    pub counted: bool,
 }
 
 /// Deletes click events older than the retention setting, in bounded chunks.
@@ -630,10 +686,15 @@ pub async fn purge_old_clicks(env: &Env) -> worker::Result<usize> {
     Ok(total)
 }
 
-pub async fn record_click(env: &Env, c: Click<'_>) -> worker::Result<()> {
+/// Logs a click: to Analytics Engine when it is configured (no D1 writes; a cron job
+/// rolls the counts into `links.clicks`), otherwise to the D1 `clicks` table.
+pub async fn record_click(env: &Env, c: &Click) -> worker::Result<()> {
+    if crate::analytics::enabled(env) {
+        return crate::analytics::write(env, c);
+    }
     let d = db(env)?;
     let mut stmts = vec![d
-        .prepare("INSERT INTO clicks (link_id, ts, country, city, referrer, device, os, browser, bot, qr) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")
+        .prepare("INSERT INTO clicks (link_id, ts, country, city, referrer, device, os, browser, bot, qr, variant) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
         .bind(&[
             n(c.link_id),
             n(c.ts),
@@ -645,13 +706,43 @@ pub async fn record_click(env: &Env, c: Click<'_>) -> worker::Result<()> {
             s(c.browser),
             b(c.bot),
             b(c.qr),
+            os(&c.variant),
         ])?];
-    if !c.bot {
+    if !c.bot && !c.counted {
         stmts.push(
             d.prepare("UPDATE links SET clicks = clicks + 1, last_click_at = ?2 WHERE id = ?1")
                 .bind(&[n(c.link_id), n(c.ts)])?,
         );
     }
     d.batch(stmts).await?;
+    Ok(())
+}
+
+// ---- Small key/value state in the settings table (cursors, last backup time) ----
+
+pub async fn get_state(env: &Env, key: &str) -> worker::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Row {
+        value: String,
+    }
+    Ok(db(env)?
+        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .bind(&[s(key)])?
+        .first::<Row>(None)
+        .await?
+        .map(|r| r.value))
+}
+
+pub fn set_state_stmt(
+    d: &D1Database,
+    key: &str,
+    value: &str,
+) -> worker::Result<D1PreparedStatement> {
+    d.prepare("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .bind(&[s(key), s(value)])
+}
+
+pub async fn set_state(env: &Env, key: &str, value: &str) -> worker::Result<()> {
+    set_state_stmt(&db(env)?, key, value)?.run().await?;
     Ok(())
 }

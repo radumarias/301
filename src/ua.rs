@@ -50,6 +50,35 @@ const BOT_MARKERS: &[&str] = &[
     "postman",
 ];
 
+/// Crawlers that build link previews (cards) in chat apps and social networks.
+/// iMessage sends a UA containing both "facebookexternalhit" and "Twitterbot".
+const PREVIEW_MARKERS: &[&str] = &[
+    "facebookexternalhit",
+    "facebot",
+    "twitterbot",
+    "slackbot",
+    "linkedinbot",
+    "discordbot",
+    "telegrambot",
+    "whatsapp",
+    "skypeuripreview",
+    "pinterest",
+    "redditbot",
+    "embedly",
+    "mastodon",
+    "bluesky",
+    "cardyb",
+    "vkshare",
+    "iframely",
+    "google-pagerenderer",
+    "applebot",
+];
+
+pub fn is_preview_crawler(ua: &str) -> bool {
+    let l = ua.to_ascii_lowercase();
+    PREVIEW_MARKERS.iter().any(|m| l.contains(m))
+}
+
 pub fn parse(ua: &str) -> UaInfo {
     let l = ua.to_ascii_lowercase();
     let bot = l.is_empty() || BOT_MARKERS.iter().any(|m| l.contains(m));
@@ -158,5 +187,14 @@ mod tests {
         assert!(parse("curl/8.5.0").bot);
         assert!(parse("Googlebot/2.1").bot);
         assert!(parse("").bot);
+        assert!(is_preview_crawler(
+            "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)"
+        ));
+        assert!(is_preview_crawler(
+            "Mozilla/5.0 (compatible; Twitterbot/1.0)"
+        ));
+        assert!(!is_preview_crawler(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari/604.1"
+        ));
     }
 }

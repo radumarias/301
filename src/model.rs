@@ -65,6 +65,78 @@ impl Device {
     }
 }
 
+/// What link-preview crawlers (Slack, X, iMessage, WhatsApp...) see instead of a redirect.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Og {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+impl Og {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.description.is_none() && self.image.is_none()
+    }
+}
+
+/// One extra destination of an A/B split. `weight` is a percentage; the main URL gets
+/// whatever the variants leave.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Variant {
+    pub url: String,
+    pub weight: u8,
+}
+
+pub const MAX_VARIANTS: usize = 4;
+
+/// App URIs (custom schemes such as `myapp://item/42`) tried before the web destination.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct AppLinks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ios: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<String>,
+}
+
+impl AppLinks {
+    pub fn is_empty(&self) -> bool {
+        self.ios.is_none() && self.android.is_none()
+    }
+
+    /// The app URI for a visitor's OS, if any.
+    pub fn for_os(&self, os: &str) -> Option<&str> {
+        match os {
+            "iOS" => self.ios.as_deref(),
+            "Android" => self.android.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Last result of the broken-link checker.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Health {
+    /// HTTP status of the destination; 0 when the request failed (DNS, TLS, timeout).
+    pub code: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub checked_at: i64,
+    pub broken: bool,
+}
+
+/// Statuses the checker reports as broken. 401/403/429 are left out: many sites answer
+/// bots that way while working fine for people.
+pub fn is_broken(code: i64) -> bool {
+    code == 0 || code == 404 || code == 410 || code >= 500
+}
+
+/// SQL twin of `is_broken`, for list filters and counts.
+pub const BROKEN_SQL: &str =
+    "(health_code IS NOT NULL AND (health_code = 0 OR health_code IN (404, 410) OR health_code >= 500))";
+
 /// A link as returned by the admin API.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Link {
@@ -86,6 +158,10 @@ pub struct Link {
     pub utm: Utm,
     pub geo: BTreeMap<String, String>,
     pub device: Device,
+    pub og: Og,
+    pub variants: Vec<Variant>,
+    pub app: AppLinks,
+    pub health: Option<Health>,
     pub source: String,
     pub clicks: i64,
     pub last_click_at: Option<i64>,
@@ -147,6 +223,12 @@ pub struct LinkRow {
     pub utm: Option<String>,
     pub geo: Option<String>,
     pub device: Option<String>,
+    pub og: Option<String>,
+    pub variants: Option<String>,
+    pub app: Option<String>,
+    pub health_code: Option<i64>,
+    pub health_error: Option<String>,
+    pub health_checked_at: Option<i64>,
     pub source: Option<String>,
     pub clicks: i64,
     pub last_click_at: Option<i64>,
@@ -180,6 +262,18 @@ impl From<LinkRow> for Link {
             utm: parse_json(&r.utm),
             geo: parse_json(&r.geo),
             device: parse_json(&r.device),
+            og: parse_json(&r.og),
+            variants: parse_json(&r.variants),
+            app: parse_json(&r.app),
+            health: match (r.health_code, r.health_checked_at) {
+                (Some(code), Some(checked_at)) => Some(Health {
+                    code,
+                    error: r.health_error,
+                    checked_at,
+                    broken: is_broken(code),
+                }),
+                _ => None,
+            },
             source: r.source.unwrap_or_else(|| "manual".into()),
             clicks: r.clicks,
             last_click_at: r.last_click_at,
@@ -227,6 +321,9 @@ pub struct LinkInput {
     pub utm: Option<Utm>,
     pub geo: Option<BTreeMap<String, String>>,
     pub device: Option<Device>,
+    pub og: Option<Og>,
+    pub variants: Option<Vec<Variant>>,
+    pub app: Option<AppLinks>,
     pub source: Option<String>,
     /// Tags merged into the existing ones (bulk actions, imports).
     #[serde(default)]
@@ -261,6 +358,22 @@ pub fn validate_url(u: &str) -> Result<(), String> {
         Ok(_) => Err(format!("only http(s) URLs are allowed: {u}")),
         Err(e) => Err(format!("invalid URL {u}: {e}")),
     }
+}
+
+/// App deep links use custom schemes, so anything parseable goes except schemes that run
+/// code or read local data in a browser.
+pub fn validate_app_uri(u: &str) -> Result<(), String> {
+    if u.len() > 2048 {
+        return Err("app link is longer than 2048 characters".into());
+    }
+    let p = url::Url::parse(u).map_err(|e| format!("invalid app link {u}: {e}"))?;
+    if ["javascript", "data", "vbscript", "file", "blob", "about"].contains(&p.scheme()) {
+        return Err(format!("app links cannot use the {}: scheme", p.scheme()));
+    }
+    if u.contains(['"', '<', '>', '\\', '`']) || u.chars().any(char::is_control) {
+        return Err("app link contains characters that are not allowed".into());
+    }
+    Ok(())
 }
 
 pub fn normalize_tags(tags: Vec<String>) -> Vec<String> {
@@ -332,6 +445,29 @@ impl LinkInput {
                 desktop: clean(d.desktop.clone()),
             };
         }
+        if let Some(o) = &self.og {
+            link.og = Og {
+                title: clean(o.title.clone()),
+                description: clean(o.description.clone()),
+                image: clean(o.image.clone()),
+            };
+        }
+        if let Some(v) = &self.variants {
+            link.variants = v
+                .iter()
+                .filter(|v| !v.url.trim().is_empty())
+                .map(|v| Variant {
+                    url: v.url.trim().to_string(),
+                    weight: v.weight,
+                })
+                .collect();
+        }
+        if let Some(a) = &self.app {
+            link.app = AppLinks {
+                ios: clean(a.ios.clone()),
+                android: clean(a.android.clone()),
+            };
+        }
         if let Some(t) = &self.add_tags {
             link.tags = normalize_tags(link.tags.iter().chain(t).cloned().collect());
         }
@@ -363,6 +499,30 @@ pub fn validate_link(link: &Link) -> Result<(), String> {
         .flatten()
     {
         validate_url(u)?;
+    }
+    if let Some(img) = &link.og.image {
+        validate_url(img)?;
+    }
+    if link.og.title.as_ref().is_some_and(|t| t.len() > 300) {
+        return Err("preview title is longer than 300 characters".into());
+    }
+    if link.og.description.as_ref().is_some_and(|t| t.len() > 1000) {
+        return Err("preview description is longer than 1000 characters".into());
+    }
+    if link.variants.len() > MAX_VARIANTS {
+        return Err(format!("at most {MAX_VARIANTS} A/B variants"));
+    }
+    for v in &link.variants {
+        validate_url(&v.url)?;
+        if !(1..=99).contains(&v.weight) {
+            return Err("variant weight must be between 1 and 99".into());
+        }
+    }
+    if link.variants.iter().map(|v| v.weight as u32).sum::<u32>() > 99 {
+        return Err("variant weights must add up to 99 or less, the main URL gets the rest".into());
+    }
+    for u in [&link.app.ios, &link.app.android].into_iter().flatten() {
+        validate_app_uri(u)?;
     }
     if link.title.as_ref().is_some_and(|t| t.len() > 512) {
         return Err("title is longer than 512 characters".into());
@@ -446,6 +606,9 @@ pub struct KvRecord {
     pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_clicks: Option<i64>,
+    /// Set once `max_clicks` is used up, so the redirect path needs no D1 read to know.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +617,12 @@ pub struct KvRecord {
     pub geo: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Device::is_empty")]
     pub device: Device,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<Variant>,
+    #[serde(default, skip_serializing_if = "Og::is_empty")]
+    pub og: Og,
+    #[serde(default, skip_serializing_if = "AppLinks::is_empty")]
+    pub app: AppLinks,
     #[serde(default)]
     pub passthrough: bool,
 }
@@ -467,6 +636,7 @@ impl KvRecord {
             disabled: l.disabled,
             expires_at: l.expires_at,
             max_clicks: l.max_clicks,
+            exhausted: l.max_clicks.is_some_and(|m| l.clicks >= m),
             fallback: l.fallback_url.clone(),
             pw: l.password_hash.clone(),
             geo: l
@@ -475,22 +645,63 @@ impl KvRecord {
                 .map(|(k, v)| (k.clone(), apply_utm(v, &l.utm)))
                 .collect(),
             device: l.device.map(|u| apply_utm(u, &l.utm)),
+            variants: l
+                .variants
+                .iter()
+                .map(|v| Variant {
+                    url: apply_utm(&v.url, &l.utm),
+                    weight: v.weight,
+                })
+                .collect(),
+            og: l.og.clone(),
+            app: l.app.clone(),
             passthrough: l.passthrough,
         }
     }
 
-    /// Picks the destination: device rule, then geo rule, then the default.
-    pub fn destination(&self, os: &str, device: &str, country: Option<&str>) -> &str {
+    /// Picks the destination: device rule, then geo rule, then the A/B split (or the
+    /// default). `roll` gives a random number in 0..100 and is only called for a split.
+    /// The bool says the destination came from the A/B split.
+    pub fn destination(
+        &self,
+        os: &str,
+        device: &str,
+        country: Option<&str>,
+        roll: impl FnOnce() -> u8,
+    ) -> (&str, bool) {
         let by_device = match os {
             "iOS" => self.device.ios.as_deref(),
             "Android" => self.device.android.as_deref(),
             _ if device == "desktop" => self.device.desktop.as_deref(),
             _ => None,
         };
-        by_device
-            .or_else(|| country.and_then(|c| self.geo.get(c)).map(String::as_str))
-            .unwrap_or(&self.url)
+        if let Some(u) =
+            by_device.or_else(|| country.and_then(|c| self.geo.get(c)).map(String::as_str))
+        {
+            return (u, false);
+        }
+        if self.variants.is_empty() {
+            return (&self.url, false);
+        }
+        let url = match variant_index(&self.variants, roll()) {
+            0 => &self.url,
+            i => &self.variants[i - 1].url,
+        };
+        (url, true)
     }
+}
+
+/// Index of the variant `roll` (0..100) lands on: variants take the first slices of the
+/// range, the main URL (index 0) the rest.
+pub fn variant_index(variants: &[Variant], roll: u8) -> usize {
+    let mut acc = 0u32;
+    for (i, v) in variants.iter().enumerate() {
+        acc += v.weight as u32;
+        if (roll as u32) < acc {
+            return i + 1;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -543,8 +754,12 @@ mod tests {
             disabled: false,
             expires_at: None,
             max_clicks: None,
+            exhausted: false,
             fallback: None,
             pw: None,
+            variants: vec![],
+            og: Og::default(),
+            app: AppLinks::default(),
             geo: BTreeMap::from([("RO".into(), "https://ro".into())]),
             device: Device {
                 ios: Some("https://ios".into()),
@@ -552,16 +767,40 @@ mod tests {
             },
             passthrough: false,
         };
-        assert_eq!(r.destination("iOS", "mobile", Some("RO")), "https://ios");
-        assert_eq!(r.destination("Android", "mobile", Some("RO")), "https://ro");
         assert_eq!(
-            r.destination("Windows", "desktop", Some("US")),
-            "https://default"
+            r.destination("iOS", "mobile", Some("RO"), || 0).0,
+            "https://ios"
+        );
+        assert_eq!(
+            r.destination("Android", "mobile", Some("RO"), || 0).0,
+            "https://ro"
+        );
+        assert_eq!(
+            r.destination("Windows", "desktop", Some("US"), || 0),
+            ("https://default", false)
         );
         r.device.desktop = Some("https://desk".into());
         assert_eq!(
-            r.destination("Windows", "desktop", Some("RO")),
+            r.destination("Windows", "desktop", Some("RO"), || 0).0,
             "https://desk"
+        );
+        // A/B split only applies when no rule matched.
+        r.variants = vec![Variant {
+            url: "https://b".into(),
+            weight: 30,
+        }];
+        assert_eq!(
+            r.destination("Windows", "desktop", None, || 10),
+            ("https://desk", false)
+        );
+        r.device.desktop = None;
+        assert_eq!(
+            r.destination("Linux", "desktop", None, || 10),
+            ("https://b", true)
+        );
+        assert_eq!(
+            r.destination("Linux", "desktop", None, || 30),
+            ("https://default", true)
         );
     }
 
@@ -628,6 +867,84 @@ mod tests {
         };
         rm.apply(&mut l).unwrap();
         assert_eq!(l.tags, vec!["b"]);
+    }
+
+    #[test]
+    fn variant_split() {
+        let v = vec![
+            Variant {
+                url: "b".into(),
+                weight: 20,
+            },
+            Variant {
+                url: "c".into(),
+                weight: 30,
+            },
+        ];
+        assert_eq!(variant_index(&v, 0), 1);
+        assert_eq!(variant_index(&v, 19), 1);
+        assert_eq!(variant_index(&v, 20), 2);
+        assert_eq!(variant_index(&v, 49), 2);
+        assert_eq!(variant_index(&v, 50), 0);
+        assert_eq!(variant_index(&v, 99), 0);
+        assert_eq!(variant_index(&[], 5), 0);
+    }
+
+    #[test]
+    fn new_field_validation() {
+        let mut l = Link {
+            url: "https://ok.com".into(),
+            redirect_type: 302,
+            ..Default::default()
+        };
+        l.variants = vec![
+            Variant {
+                url: "https://b.com".into(),
+                weight: 60,
+            },
+            Variant {
+                url: "https://c.com".into(),
+                weight: 40,
+            },
+        ];
+        assert!(
+            validate_link(&l).is_err(),
+            "weights must leave room for the main URL"
+        );
+        l.variants[1].weight = 39;
+        assert!(validate_link(&l).is_ok());
+        l.variants[1].weight = 0;
+        assert!(validate_link(&l).is_err());
+        l.variants.clear();
+        l.app.ios = Some("myapp://item/42".into());
+        assert!(validate_link(&l).is_ok());
+        l.app.ios = Some("javascript:alert(1)".into());
+        assert!(validate_link(&l).is_err());
+        l.app.ios = Some("myapp://x\"><script>".into());
+        assert!(validate_link(&l).is_err());
+        l.app.ios = None;
+        l.og.image = Some("ftp://x/y.png".into());
+        assert!(validate_link(&l).is_err());
+    }
+
+    #[test]
+    fn exhausted_flag() {
+        let mut l = Link {
+            url: "https://ok.com".into(),
+            redirect_type: 302,
+            max_clicks: Some(3),
+            clicks: 2,
+            ..Default::default()
+        };
+        assert!(!KvRecord::from_link(&l).exhausted);
+        l.clicks = 3;
+        assert!(KvRecord::from_link(&l).exhausted);
+    }
+
+    #[test]
+    fn health_broken() {
+        assert!(is_broken(0) && is_broken(404) && is_broken(503));
+        assert!(!is_broken(200) && !is_broken(403) && !is_broken(429));
     }
 
     #[test]

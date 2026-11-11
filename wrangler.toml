@@ -1,9 +1,9 @@
 name = "xorio-301"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
-# Served on <name>.<account subdomain>.workers.dev. To move to a custom domain, set
-# workers_dev = false, add routes = [{ pattern = "301.xorio.rs", custom_domain = true }]
-# and the DOMAIN repo variable.
+# Served on <name>.<account subdomain>.workers.dev. To move to a custom domain, set the
+# DOMAIN repo variable (e.g. 301.xorio.rs): scripts/provision.sh then sets
+# workers_dev = false and adds the custom_domain route in CI.
 workers_dev = true
 # Version preview URLs would expose the Worker on extra hosts outside the Access app.
 preview_urls = false
@@ -11,11 +11,6 @@ preview_urls = false
 [build]
 command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
 watch_dir = ["src", "ui", "migrations"]
-
-# Hourly click-retention purge (Settings -> Keep click details for). Each run deletes
-# up to 100k expired rows, so a backlog drains within a few hours.
-[triggers]
-crons = ["23 * * * *"]
 
 [observability]
 enabled = true
@@ -43,6 +38,27 @@ namespace_id = "3011"
   limit = 100
   period = 60
 
+# Cron jobs (must match HOURLY / NIGHTLY in src/lib.rs). Every 10 minutes: roll
+# Analytics Engine clicks into link totals and check a batch of destinations for broken
+# links. Hourly: click-retention purge (Settings -> Keep click details for; up to 100k
+# expired rows per run). Nightly: R2 backup and backup pruning.
+[triggers]
+crons = ["*/10 * * * *", "23 * * * *", "17 3 * * *"]
+
+# >>> ae (scripts/provision.sh removes this block unless ANALYTICS_API_TOKEN is set)
+# Click analytics on Analytics Engine; stats are read back through the SQL API with the
+# ANALYTICS_API_TOKEN secret. Without it clicks keep going to D1.
+[[analytics_engine_datasets]]
+binding = "CLICKS_AE"
+dataset = "xorio_301_clicks"
+# <<< ae
+
+# >>> r2 (scripts/provision.sh removes this block when R2 is not enabled on the account)
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "xorio-301-backups"
+# <<< r2
+
 [vars]
 # Set by scripts/provision.sh from the Cloudflare Access application.
 ACCESS_TEAM_DOMAIN = ""
@@ -53,3 +69,7 @@ ADMIN_EMAILS = ""
 ADMIN_SERVICE_TOKENS = ""
 # Optional contact (email or URL) shown on the public /privacy page.
 PRIVACY_CONTACT = ""
+# Account that owns the Analytics Engine dataset (set by scripts/provision.sh).
+CLOUDFLARE_ACCOUNT_ID = ""
+# Must match the dataset above.
+AE_DATASET = "xorio_301_clicks"
