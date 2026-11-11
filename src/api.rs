@@ -258,11 +258,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
                 },
                 None => None,
             };
-            let res = create_link(&env, &req, &st, &input, &who, scope.is_some()).await;
-            if let (Some(r), Err(_) | Ok(Err(_))) = (reservation, &res) {
-                account::release_creation(&env, r).await?;
-            }
-            match res {
+            match create_link(&env, &req, &st, &input, &who, reservation).await {
                 Ok(Ok(link)) => json(&link, 201),
                 Ok(Err(r)) => Ok(r),
                 Err(e) => store_err(e),
@@ -655,11 +651,27 @@ async fn create_link(
     st: &store::Settings,
     input: &LinkInput,
     who: &Identity,
-    check: bool,
+    reservation: Option<i64>,
 ) -> SResult<std::result::Result<Link, Response>> {
-    let mut link = store::new_link(env, st, input, "manual").await?;
-    if check {
+    // A refusal before saving gives the reservation back. Once `insert_link` runs it is
+    // kept, even on error: the row may be in D1 although the KV write failed.
+    let release = || async {
+        if let Some(r) = reservation {
+            account::release_creation(env, r).await?;
+        }
+        SResult::Ok(())
+    };
+    let mut link = match store::new_link(env, st, input, "manual").await {
+        Ok(l) => l,
+        Err(e) => {
+            release().await?;
+            return Err(e);
+        }
+    };
+    // Only non-admins have a reservation, and only their destinations are checked.
+    if reservation.is_some() {
         if let Err(r) = check_destinations(env, req, &link).await {
+            release().await?;
             return Ok(Err(r));
         }
     }
