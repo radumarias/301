@@ -17,7 +17,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Crypto", "SubtleCrypto", "CryptoKey", "WorkerGlobalScope"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-base64 = "0.22"
+base64 = "0.23"
 url = "2"
 getrandom = { version = "0.2", features = ["js"] }
 percent-encoding = "2"
