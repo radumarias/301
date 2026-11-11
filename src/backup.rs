@@ -1,10 +1,10 @@
-//! Nightly backups to R2 and click retention.
+//! Nightly backups to R2 (click retention is `store::purge_old_clicks`, hourly).
 //!
 //! Each night writes `daily/<YYYY-MM-DD>.json` with every link (password hashes
 //! included), alias, setting and webhook, so the whole admin state can be restored.
 //! Raw click rows are not included (they can be large); link totals are.
 
-use crate::store::{self, n, Settings};
+use crate::store::{self, n};
 use crate::util::{iso, now_ms};
 use serde::Serialize;
 use serde_json::Value;
@@ -135,31 +135,6 @@ pub fn valid_key(key: &str) -> bool {
     key.strip_prefix(PREFIX)
         .and_then(|k| k.strip_suffix(".json"))
         .is_some_and(|d| d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'))
-}
-
-/// Deletes raw click rows past the retention window, in chunks so one run stays within
-/// D1 limits. Link totals (`links.clicks`) are not touched.
-pub async fn apply_retention(env: &Env, st: &Settings) -> worker::Result<i64> {
-    if st.click_retention_days == 0 {
-        return Ok(0);
-    }
-    let cutoff = now_ms() - st.click_retention_days as i64 * DAY_MS;
-    let mut deleted = 0;
-    for _ in 0..20 {
-        let res = store::db(env)?
-            .prepare(
-                "DELETE FROM clicks WHERE id IN (SELECT id FROM clicks WHERE ts < ?1 LIMIT 5000)",
-            )
-            .bind(&[n(cutoff)])?
-            .run()
-            .await?;
-        let changes = res.meta()?.and_then(|m| m.changes).unwrap_or(0) as i64;
-        deleted += changes;
-        if changes < 5000 {
-            break;
-        }
-    }
-    Ok(deleted)
 }
 
 #[cfg(test)]

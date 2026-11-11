@@ -39,47 +39,57 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     } else {
         redirect::handle(req, env, ctx).await
     };
-    res.or_else(|e| {
+    let mut res = res.or_else(|e| {
         worker::console_error!("unhandled: {e}");
         Response::error("Internal error", 500)
-    })
+    })?;
+    util::harden(&mut res)?;
+    Ok(res)
 }
 
 /// Cron jobs (see `[triggers]` in wrangler.toml):
 /// * every 10 minutes: roll Analytics Engine clicks into link totals, check a batch of
 ///   destinations for broken links
-/// * nightly: back up to R2, prune old backups, delete raw clicks past retention
+/// * hourly: delete click events past the retention setting
+/// * nightly: back up to R2 and prune old backups
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    if event.cron() == NIGHTLY {
-        let st = store::settings(&env).await.unwrap_or_default();
-        if backup::enabled(&env) {
+    match event.cron().as_str() {
+        HOURLY => match store::purge_old_clicks(&env).await {
+            Ok(n) => worker::console_log!("click retention: deleted {n} old click events"),
+            Err(e) => worker::console_error!("click retention failed: {e}"),
+        },
+        NIGHTLY => {
+            if !backup::enabled(&env) {
+                return;
+            }
             match backup::run(&env).await {
                 Ok(key) => worker::console_log!("backup written: {key}"),
                 Err(e) => worker::console_error!("backup failed: {e}"),
             }
-            if let Err(e) = backup::prune(&env, st.backup_keep_days).await {
+            let keep = store::settings(&env)
+                .await
+                .unwrap_or_default()
+                .backup_keep_days;
+            if let Err(e) = backup::prune(&env, keep).await {
                 worker::console_error!("backup prune failed: {e}");
             }
         }
-        match backup::apply_retention(&env, &st).await {
-            Ok(n) if n > 0 => worker::console_log!("deleted {n} old click rows"),
-            Ok(_) => {}
-            Err(e) => worker::console_error!("click retention failed: {e}"),
+        _ => {
+            let (rollup, checks) =
+                futures_util::future::join(analytics::rollup(&env), health::run_batch(&env)).await;
+            if let Err(e) = rollup {
+                worker::console_error!("analytics rollup failed: {e}");
+            }
+            match checks {
+                Ok(n) if n > 0 => worker::console_log!("checked {n} destinations"),
+                Ok(_) => {}
+                Err(e) => worker::console_error!("link check failed: {e}"),
+            }
         }
-        return;
-    }
-    let (rollup, checks) =
-        futures_util::future::join(analytics::rollup(&env), health::run_batch(&env)).await;
-    if let Err(e) = rollup {
-        worker::console_error!("analytics rollup failed: {e}");
-    }
-    match checks {
-        Ok(n) if n > 0 => worker::console_log!("checked {n} destinations"),
-        Ok(_) => {}
-        Err(e) => worker::console_error!("link check failed: {e}"),
     }
 }
 
-/// Must match the nightly entry in wrangler.toml `[triggers] crons`.
+/// Must match the entries in wrangler.toml `[triggers] crons`.
+pub const HOURLY: &str = "23 * * * *";
 pub const NIGHTLY: &str = "17 3 * * *";

@@ -149,7 +149,7 @@ test("webhooks", async () => {
 
 test("settings validation, status, backups and docs", async () => {
   const st = (await api("GET", "/settings")).data;
-  assert.equal((await api("PUT", "/settings", { ...st, click_retention_days: 3 })).status, 400);
+  assert.equal((await api("PUT", "/settings", { ...st, click_retention_days: 4000 })).status, 400);
   assert.equal((await api("PUT", "/settings", { ...st, click_retention_days: 0 })).status, 200);
   const status = (await api("GET", "/status")).data;
   assert.equal(typeof status.analytics_engine, "boolean");

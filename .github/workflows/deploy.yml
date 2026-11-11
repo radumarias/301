@@ -11,26 +11,39 @@ on:
         type: choice
         options: [production, staging]
         default: production
+  schedule:
+    # Weekly dependency audit, so new advisories show up without a push.
+    - cron: "17 6 * * 1"
+
+# Least privilege: jobs only read the repo. Cloudflare access comes from secrets.
+permissions:
+  contents: read
 
 concurrency:
-  group: deploy-${{ github.ref }}
+  # The weekly audit gets its own group: queuing it must never cancel a pending deploy.
+  group: deploy-${{ github.ref }}${{ github.event_name == 'schedule' && '-audit' || '' }}
   cancel-in-progress: false
 
+# Third-party actions are pinned to commit SHAs (tag in the comment); Dependabot bumps them.
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - run: node --check ui/app.js
@@ -38,19 +51,23 @@ jobs:
 
   e2e:
     # Runs the real Worker under `wrangler dev` (local D1, KV and R2) and drives it over HTTP.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: cargo install -q worker-build@^0.8
+      - run: cargo install -q --locked worker-build@0.8.7
       - name: Local config
         run: |
           sed -i '/^# >>> ae/,/^# <<< ae/d' wrangler.toml
@@ -64,6 +81,21 @@ jobs:
       - if: failure()
         run: tail -n 200 wrangler.log
 
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm audit --audit-level=moderate
+
   deploy:
     needs: [test, e2e]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -73,9 +105,11 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       ANALYTICS_API_TOKEN: ${{ secrets.ANALYTICS_API_TOKEN }}
-      ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
+      # Prefer the ADMIN_EMAILS secret: secrets are masked in the (public) logs, variables are not.
+      ADMIN_EMAILS: ${{ secrets.ADMIN_EMAILS || vars.ADMIN_EMAILS }}
       ADMIN_SERVICE_TOKENS: ${{ vars.ADMIN_SERVICE_TOKENS }}
       ACCESS_TEAM_DOMAIN: ${{ vars.ACCESS_TEAM_DOMAIN }}
+      PRIVACY_CONTACT: ${{ vars.PRIVACY_CONTACT }}
       # Staging is a full second copy with its own Worker, KV, D1, R2 and Access app,
       # served on xorio-301-staging.<subdomain>.workers.dev.
       DOMAIN: ${{ inputs.target == 'staging' && vars.STAGING_DOMAIN || vars.DOMAIN }}
@@ -86,12 +120,15 @@ jobs:
       AE_DATASET: ${{ inputs.target == 'staging' && 'xorio_301_staging_clicks' || 'xorio_301_clicks' }}
       APP_NAME: ${{ inputs.target == 'staging' && '301 admin (staging)' || '301 admin' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm

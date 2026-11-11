@@ -5,9 +5,11 @@ compatibility_date = "2026-10-01"
 # DOMAIN repo variable (e.g. 301.xorio.rs): scripts/provision.sh then sets
 # workers_dev = false and adds the custom_domain route in CI.
 workers_dev = true
+# Version preview URLs would expose the Worker on extra hosts outside the Access app.
+preview_urls = false
 
 [build]
-command = "cargo install -q worker-build@^0.8 && worker-build --release"
+command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
 watch_dir = ["src", "ui", "migrations"]
 
 [observability]
@@ -36,11 +38,12 @@ namespace_id = "3011"
   limit = 100
   period = 60
 
-# Cron jobs. Every 10 minutes: roll Analytics Engine clicks into link totals and check a
-# batch of destinations for broken links. Nightly (must match NIGHTLY in src/lib.rs):
-# R2 backup, backup pruning, click retention.
+# Cron jobs (must match HOURLY / NIGHTLY in src/lib.rs). Every 10 minutes: roll
+# Analytics Engine clicks into link totals and check a batch of destinations for broken
+# links. Hourly: click-retention purge (Settings -> Keep click details for; up to 100k
+# expired rows per run). Nightly: R2 backup and backup pruning.
 [triggers]
-crons = ["*/10 * * * *", "17 3 * * *"]
+crons = ["*/10 * * * *", "23 * * * *", "17 3 * * *"]
 
 # >>> ae (scripts/provision.sh removes this block unless ANALYTICS_API_TOKEN is set)
 # Click analytics on Analytics Engine; stats are read back through the SQL API with the
@@ -64,6 +67,8 @@ ACCESS_AUD = ""
 ADMIN_EMAILS = ""
 # Comma-separated Access service token client IDs (common_name) allowed into the API.
 ADMIN_SERVICE_TOKENS = ""
+# Optional contact (email or URL) shown on the public /privacy page.
+PRIVACY_CONTACT = ""
 # Account that owns the Analytics Engine dataset (set by scripts/provision.sh).
 CLOUDFLARE_ACCOUNT_ID = ""
 # Must match the dataset above.

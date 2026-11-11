@@ -19,12 +19,15 @@ pub fn serve(path: &str) -> Result<Response> {
     let h = res.headers_mut();
     h.set("Content-Type", ctype)?;
     h.set("Cache-Control", "no-store")?;
-    h.set("X-Frame-Options", "DENY")?;
-    h.set("X-Content-Type-Options", "nosniff")?;
     h.set("Referrer-Policy", "same-origin")?;
+    h.set("Cross-Origin-Opener-Policy", "same-origin")?;
+    h.set(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    )?;
     h.set(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
+        "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     )?;
     Ok(res)
 }
