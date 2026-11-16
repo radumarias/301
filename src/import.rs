@@ -398,15 +398,24 @@ impl ImportRow {
     }
 }
 
-async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Taken {
+    Live(i64),
+    Retired,
+}
+
+async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, Taken>> {
     #[derive(Deserialize)]
     struct Row {
         slug: String,
         id: i64,
+        retired: Option<i64>,
     }
     let d = store::db(env)?;
     let mut stmts = vec![];
-    for chunk in slugs.chunks(40) {
+    // Live slugs match exactly (imported services are case-sensitive). Retired slugs
+    // match case-insensitively and can never be overwritten or re-created by an import.
+    for chunk in slugs.chunks(30) {
         let marks = vec!["?"; chunk.len()].join(",");
         let binds: Vec<_> = chunk.iter().chain(chunk).map(|c| s(c)).collect();
         stmts.push(
@@ -415,18 +424,39 @@ async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
             ))
             .bind(&binds)?,
         );
+        let ors = vec!["slug = ? COLLATE NOCASE"; chunk.len()].join(" OR ");
+        let binds: Vec<_> = chunk.iter().map(|c| s(c)).collect();
+        stmts.push(
+            d.prepare(format!(
+                "SELECT slug, link_id AS id, 1 AS retired FROM retired_slugs WHERE {ors}"
+            ))
+            .bind(&binds)?,
+        );
     }
     let mut out = HashMap::new();
     if stmts.is_empty() {
         return Ok(out);
     }
+    let mut retired: Vec<String> = vec![];
     for res in d.batch(stmts).await? {
-        out.extend(res.results::<Row>()?.into_iter().map(|r| (r.slug, r.id)));
+        for r in res.results::<Row>()? {
+            if r.retired.unwrap_or(0) != 0 {
+                retired.push(r.slug.to_lowercase());
+            } else {
+                out.insert(r.slug, Taken::Live(r.id));
+            }
+        }
+    }
+    // Map each requested slug that matches a retired one (any case) to Retired.
+    for sl in slugs {
+        if !out.contains_key(sl) && retired.contains(&sl.to_lowercase()) {
+            out.insert(sl.clone(), Taken::Retired);
+        }
     }
     Ok(out)
 }
 
-pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
+pub async fn commit(env: &Env, req: CommitRequest, created_by: &str) -> SResult<CommitResult> {
     if req.rows.len() > 100 {
         return Err(StoreError::Bad(
             "at most 100 rows per commit; send them in chunks".into(),
@@ -503,10 +533,19 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                     result.skipped += 1;
                     continue;
                 }
+                // A retired slug is never overwritten: that would be exactly the hijack
+                // the tombstone exists to prevent.
+                "overwrite" if conflict == Some(Taken::Retired) => {
+                    fail(Some(&slug_v), store::RETIRED_MSG.into());
+                    continue;
+                }
                 "overwrite" if !dup => {
                     // Same write path as an edit in the admin UI.
-                    let Some(mut link) = store::get_link(env, conflict.unwrap_or_default()).await?
-                    else {
+                    let Some(Taken::Live(id)) = conflict else {
+                        continue;
+                    };
+                    let Some(mut link) = store::get_link(env, id).await? else {
+                        fail(Some(&slug_v), "link was deleted during the import".into());
                         continue;
                     };
                     match store::prepare_update(env, &mut link, &input).await {
@@ -527,7 +566,7 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                         let cand = format!("{base}-{k}");
                         if !seen.contains(&cand)
                             && !existing.contains_key(&cand)
-                            && store::slug_owner(env, &cand).await?.is_none()
+                            && store::slug_held(env, &cand, None, false).await?.is_none()
                         {
                             found = Some(cand);
                             break;
@@ -546,6 +585,7 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
         }
 
         let mut link = Link::new(st.default_redirect, "csv");
+        link.created_by = Some(created_by.to_string());
         if let Err(e) = input.apply(&mut link) {
             fail(Some(&slug_v), e);
             continue;

@@ -87,6 +87,10 @@ pub struct Link {
     pub geo: BTreeMap<String, String>,
     pub device: Device,
     pub source: String,
+    /// Access email of the admin who created the link (None for links made before this
+    /// was recorded). Only they may restore the link's slugs after it is deleted.
+    #[serde(default, skip_deserializing)]
+    pub created_by: Option<String>,
     pub clicks: i64,
     pub last_click_at: Option<i64>,
     pub created_at: i64,
@@ -148,6 +152,7 @@ pub struct LinkRow {
     pub geo: Option<String>,
     pub device: Option<String>,
     pub source: Option<String>,
+    pub created_by: Option<String>,
     pub clicks: i64,
     pub last_click_at: Option<i64>,
     pub created_at: i64,
@@ -181,6 +186,7 @@ impl From<LinkRow> for Link {
             geo: parse_json(&r.geo),
             device: parse_json(&r.device),
             source: r.source.unwrap_or_else(|| "manual".into()),
+            created_by: r.created_by,
             clicks: r.clicks,
             last_click_at: r.last_click_at,
             created_at: r.created_at,
