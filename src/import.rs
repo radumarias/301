@@ -5,7 +5,7 @@
 
 use crate::model::{Link, LinkInput};
 use crate::slug;
-use crate::store::{self, s, SResult, StoreError};
+use crate::store::{self, s, Held, SResult, StoreError};
 use crate::util::now_ms;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -398,20 +398,31 @@ impl ImportRow {
     }
 }
 
-async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
+/// Who holds each of `slugs`. Live slugs match exactly (imported services are
+/// case-sensitive); retired slugs match case-insensitively, since an import must never
+/// overwrite or re-create one. One statement per 30 slugs (90 binds, D1 allows 100).
+async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, Held>> {
     #[derive(Deserialize)]
     struct Row {
         slug: String,
         id: i64,
+        retired: i64,
     }
     let d = store::db(env)?;
     let mut stmts = vec![];
-    for chunk in slugs.chunks(40) {
+    for chunk in slugs.chunks(30) {
         let marks = vec!["?"; chunk.len()].join(",");
-        let binds: Vec<_> = chunk.iter().chain(chunk).map(|c| s(c)).collect();
+        let binds: Vec<_> = chunk
+            .iter()
+            .chain(chunk)
+            .chain(chunk)
+            .map(|c| s(c))
+            .collect();
         stmts.push(
             d.prepare(format!(
-                "SELECT slug, id FROM links WHERE slug IN ({marks}) UNION ALL SELECT slug, link_id AS id FROM aliases WHERE slug IN ({marks})"
+                "SELECT slug, id, 0 AS retired FROM links WHERE slug IN ({marks}) \
+                 UNION ALL SELECT slug, link_id, 0 FROM aliases WHERE slug IN ({marks}) \
+                 UNION ALL SELECT slug, link_id, 1 FROM retired_slugs WHERE slug COLLATE NOCASE IN ({marks})"
             ))
             .bind(&binds)?,
         );
@@ -420,13 +431,25 @@ async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, i64>> {
     if stmts.is_empty() {
         return Ok(out);
     }
+    let mut retired: HashMap<String, i64> = HashMap::new();
     for res in d.batch(stmts).await? {
-        out.extend(res.results::<Row>()?.into_iter().map(|r| (r.slug, r.id)));
+        for r in res.results::<Row>()? {
+            if r.retired != 0 {
+                retired.insert(r.slug.to_lowercase(), r.id);
+            } else {
+                out.insert(r.slug, Held::Live(r.id));
+            }
+        }
+    }
+    for sl in slugs {
+        if let Some(&id) = retired.get(&sl.to_lowercase()) {
+            out.entry(sl.clone()).or_insert(Held::Retired(id));
+        }
     }
     Ok(out)
 }
 
-pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
+pub async fn commit(env: &Env, req: CommitRequest, created_by: &str) -> SResult<CommitResult> {
     if req.rows.len() > 100 {
         return Err(StoreError::Bad(
             "at most 100 rows per commit; send them in chunks".into(),
@@ -503,10 +526,19 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                     result.skipped += 1;
                     continue;
                 }
+                // A retired slug is never overwritten: that would be exactly the hijack
+                // the tombstone exists to prevent.
+                "overwrite" if matches!(conflict, Some(Held::Retired(_))) => {
+                    fail(Some(&slug_v), store::RETIRED_MSG.into());
+                    continue;
+                }
                 "overwrite" if !dup => {
                     // Same write path as an edit in the admin UI.
-                    let Some(mut link) = store::get_link(env, conflict.unwrap_or_default()).await?
-                    else {
+                    let Some(Held::Live(id)) = conflict else {
+                        continue;
+                    };
+                    let Some(mut link) = store::get_link(env, id).await? else {
+                        fail(Some(&slug_v), "link was deleted during the import".into());
                         continue;
                     };
                     match store::prepare_update(env, &mut link, &input).await {
@@ -527,7 +559,7 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
                         let cand = format!("{base}-{k}");
                         if !seen.contains(&cand)
                             && !existing.contains_key(&cand)
-                            && store::slug_owner(env, &cand).await?.is_none()
+                            && store::slug_held(env, &cand, None, false).await?.is_none()
                         {
                             found = Some(cand);
                             break;
@@ -546,6 +578,7 @@ pub async fn commit(env: &Env, req: CommitRequest) -> SResult<CommitResult> {
         }
 
         let mut link = Link::new(st.default_redirect, "csv");
+        link.created_by = Some(created_by.to_string());
         if let Err(e) = input.apply(&mut link) {
             fail(Some(&slug_v), e);
             continue;

@@ -84,6 +84,7 @@ const routes = [
   [/^#\/links\/?$/, linksPage, "links"],
   [/^#\/links\/new$/, (m) => editPage(null), "links"],
   [/^#\/links\/(\d+)$/, (m) => editPage(Number(m[1])), "links"],
+  [/^#\/retired\/?$/, retiredPage, "retired"],
   [/^#\/import$/, importPage, "import"],
   [/^#\/settings$/, settingsPage, "settings"],
 ];
@@ -192,14 +193,33 @@ async function dashboard() {
 }
 const stat = (l, v) => h("div", { class: "panel stat" }, h("div", { class: "v" }, fmt.n(v)), h("div", { class: "l" }, l));
 
+// ---------- list helpers ----------
+// Debounced search that re-renders and keeps the caret in the re-rendered input.
+function searchBox(state, render, placeholder) {
+  const el = h("input", { type: "search", placeholder, value: state.q });
+  let timer;
+  el.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      state.q = el.value; state.offset = 0;
+      render().then(() => { const n = $app.querySelector("input[type=search]"); if (n) { n.focus(); n.setSelectionRange(n.value.length, n.value.length); } });
+    }, 250);
+  });
+  return el;
+}
+function pager(state, total, render) {
+  return h("div", { class: "pager" },
+    h("button", { class: "btn sm", disabled: state.offset === 0, onclick: () => { state.offset = Math.max(0, state.offset - state.limit); render(); } }, "← Prev"),
+    h("span", { class: "muted small" }, total ? `${state.offset + 1}–${Math.min(total, state.offset + state.limit)} of ${fmt.n(total)}` : ""),
+    h("button", { class: "btn sm", disabled: state.offset + state.limit >= total, onclick: () => { state.offset += state.limit; render(); } }, "Next →"));
+}
+
 // ---------- links list ----------
 const listState = { q: "", tag: "", sort: "created", order: "desc", status: "", offset: 0, limit: 50, selected: new Set() };
 async function linksPage() {
   const qs = new URLSearchParams({ q: listState.q, tag: listState.tag, sort: listState.sort, order: listState.order, status: listState.status, offset: listState.offset, limit: listState.limit });
   const [page, tags] = await Promise.all([api("GET", `/links?${qs}`), api("GET", "/tags")]);
-  const search = h("input", { type: "search", placeholder: "Search slug, URL, title, notes", value: listState.q });
-  let timer;
-  search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => { listState.q = search.value; listState.offset = 0; linksPage().then(() => { const el = $app.querySelector("input[type=search]"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }); }, 250); });
+  const search = searchBox(listState, linksPage, "Search slug, URL, title, notes");
   const setFilter = (k) => (e) => { listState[k] = e.target.value; listState.offset = 0; linksPage(); };
   const tagSel = h("select", { onchange: setFilter("tag") },
     h("option", { value: "" }, "All tags"), tags.map((t) => h("option", { value: t.tag, selected: t.tag === listState.tag }, `${t.tag} (${t.n})`)));
@@ -226,7 +246,7 @@ async function linksPage() {
       if (!t) return;
       tags = t.split(",").map((x) => x.trim()).filter(Boolean);
     }
-    if (action === "delete" && !confirm(`Delete ${sel.size} links and their analytics? This cannot be undone.`)) return;
+    if (action === "delete" && !confirm(`Delete ${sel.size} links and their analytics?\n\nTheir short URLs are retired for good and can never be given to another link. You can restore them later from Retired.`)) return;
     const r = await api("POST", "/links/bulk", { ids: [...sel], action, tags });
     toast(`${r.done} updated${r.errors.length ? `, ${r.errors.length} failed` : ""}`, r.errors.length > 0);
     sel.clear();
@@ -262,10 +282,38 @@ async function linksPage() {
       page.items.length ? h("div", { class: "table-wrap" }, h("table", {},
         h("thead", {}, h("tr", {}, h("th", {}, allBox), h("th", {}, "Link"), h("th", { class: "num" }, "Clicks"), h("th", {}, "Created"), h("th", {}))),
         h("tbody", {}, rows))) : h("div", { class: "empty" }, listState.q || listState.tag || listState.status ? "No links match." : "No links yet. Create one or import from another service."),
-      h("div", { class: "pager" },
-        h("button", { class: "btn sm", disabled: listState.offset === 0, onclick: () => { listState.offset = Math.max(0, listState.offset - listState.limit); linksPage(); } }, "← Prev"),
-        h("span", { class: "muted small" }, page.total ? `${listState.offset + 1}–${Math.min(page.total, listState.offset + listState.limit)} of ${fmt.n(page.total)}` : ""),
-        h("button", { class: "btn sm", disabled: listState.offset + listState.limit >= page.total, onclick: () => { listState.offset += listState.limit; linksPage(); } }, "Next →"))),
+      pager(listState, page.total, linksPage)),
+  );
+}
+
+// ---------- retired slugs ----------
+// Slugs of deleted links. They never point anywhere new; a link can only be restored as it was.
+const retiredState = { q: "", offset: 0, limit: 100 };
+async function retiredPage() {
+  const qs = new URLSearchParams({ q: retiredState.q, offset: retiredState.offset, limit: retiredState.limit });
+  const page = await api("GET", `/retired?${qs}`);
+  const search = searchBox(retiredState, retiredPage, "Search slug or URL");
+  async function restore(r) {
+    if (!confirm(`Restore the deleted link /${r.slug} → ${r.url}?\n\nIt comes back with its original destination and settings and click total (click details are not kept).`)) return;
+    try { const l = await api("POST", `/retired/${r.link_id}/restore`); toast("Restored"); location.hash = `#/links/${l.id}`; }
+    catch (err) { toast(err.message, true); }
+  }
+  const rows = page.items.map((r) => h("tr", {},
+    h("td", {},
+      h("div", {}, h("span", { class: "slug" }, "/" + r.slug), r.was_alias && h("span", { class: "badge off" }, "ALIAS")),
+      h("div", { class: "dest" }, r.title ? `${r.title} · ${r.url || "—"}` : (r.url || "—"))),
+    h("td", { class: "small muted" }, r.created_by || "—"),
+    h("td", { class: "small muted" }, fmt.date(r.retired_at)),
+    h("td", {}, !r.was_alias && h("button", { class: "btn sm", onclick: () => restore(r) }, "Restore"))));
+  $app.replaceChildren(
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Retired"),
+      h("div", { class: "muted" }, `${fmt.n(page.total)} retired slugs · a deleted link's short URL is never reused, so old copies of it can't be hijacked`))),
+    h("div", { class: "panel" },
+      h("div", { style: "margin-bottom: 8px" }, search),
+      page.items.length ? h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Slug"), h("th", {}, "Created by"), h("th", {}, "Deleted"), h("th", {}))),
+        h("tbody", {}, rows))) : h("div", { class: "empty" }, retiredState.q ? "No retired slugs match." : "No deleted links yet."),
+      pager(retiredState, page.total, retiredPage)),
   );
 }
 
@@ -301,9 +349,10 @@ async function editPage(id) {
   async function checkSlug() {
     const v = f.slug.value.trim();
     if (!v || v === L.slug) { slugStatus.textContent = isNew ? "Empty: one is generated in the default style." : "Current slug."; slugStatus.className = "hint"; return; }
-    const r = await api("GET", `/slug/check?slug=${encodeURIComponent(v)}`);
+    const r = await api("GET", `/slug/check?slug=${encodeURIComponent(v)}${L.id ? `&for=${L.id}` : ""}`);
     if (!r.valid) { slugStatus.textContent = r.reason; slugStatus.className = "hint bad"; }
-    else if (r.taken_by && r.taken_by !== L.id) { slugStatus.textContent = "Already taken."; slugStatus.className = "hint bad"; }
+    else if (r.taken_by) { slugStatus.textContent = "Already taken (slugs that differ only in letter case count as taken)."; slugStatus.className = "hint bad"; }
+    else if (r.retired_by) { slugStatus.textContent = "Retired: it belonged to a deleted link and can never point anywhere else."; slugStatus.className = "hint bad"; }
     else { slugStatus.textContent = `Available: ${shortUrl(v)}`; slugStatus.className = "hint ok"; }
   }
   f.slug.addEventListener("input", () => { clearTimeout(slugTimer); slugTimer = setTimeout(checkSlug, 300); });
@@ -399,7 +448,7 @@ async function editPage(id) {
     } catch (err) { toast(err.message, true); }
   }
   async function del() {
-    if (!confirm(`Delete /${L.slug} and all of its analytics? This cannot be undone.`)) return;
+    if (!confirm(`Delete /${L.slug} and all of its analytics?\n\nThe short URL is retired for good: it shows "deleted" and can never be given to another link. You can restore this link later from Retired.`)) return;
     try { await api("DELETE", `/links/${L.id}`); toast("Deleted"); location.hash = "#/links"; }
     catch (err) { toast(err.message, true); }
   }
@@ -415,7 +464,7 @@ async function editPage(id) {
   const aliasPanel = h("div", { class: "panel" }, h("h2", {}, "Aliases"),
     L.aliases.length ? L.aliases.map((a) => h("div", { class: "row", style: "justify-content:space-between; margin-bottom:6px" },
       h("span", { class: "slug small" }, "/" + a),
-      h("button", { class: "btn sm", onclick: async () => { await api("DELETE", `/links/${L.id}/aliases/${a.split("/").map(encodeURIComponent).join("/")}`); toast("Alias removed"); editPage(L.id); } }, "Remove")))
+      h("button", { class: "btn sm", onclick: async () => { await api("DELETE", `/links/${L.id}/aliases/${a.split("/").map(encodeURIComponent).join("/")}`); toast("Alias removed (its slug stays reserved for this link)"); editPage(L.id); } }, "Remove")))
       : h("p", { class: "muted small" }, "Renaming the slug keeps the old one working as an alias."));
   const statsWrap = h("div", { class: "grid", style: "gap:16px; margin-top:16px" });
   const range = sessionStorage.getItem("range") || "30d";

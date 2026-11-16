@@ -87,6 +87,10 @@ pub struct Link {
     pub geo: BTreeMap<String, String>,
     pub device: Device,
     pub source: String,
+    /// Access email of the admin who created the link (None for links made before this
+    /// was recorded). Only they may restore the link's slugs after it is deleted.
+    #[serde(default, skip_deserializing)]
+    pub created_by: Option<String>,
     pub clicks: i64,
     pub last_click_at: Option<i64>,
     pub created_at: i64,
@@ -148,6 +152,7 @@ pub struct LinkRow {
     pub geo: Option<String>,
     pub device: Option<String>,
     pub source: Option<String>,
+    pub created_by: Option<String>,
     pub clicks: i64,
     pub last_click_at: Option<i64>,
     pub created_at: i64,
@@ -181,6 +186,7 @@ impl From<LinkRow> for Link {
             geo: parse_json(&r.geo),
             device: parse_json(&r.device),
             source: r.source.unwrap_or_else(|| "manual".into()),
+            created_by: r.created_by,
             clicks: r.clicks,
             last_click_at: r.last_click_at,
             created_at: r.created_at,
@@ -434,9 +440,14 @@ pub fn passthrough_query(dest: &str, visitor_query: Option<&str>) -> String {
 }
 
 /// The compact record stored in KV under `s:<slug>`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct KvRecord {
+    /// The slug is retired (its link was deleted): answer 410, never redirect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool,
+    #[serde(default)]
     pub id: i64,
+    #[serde(default)]
     pub url: String,
     #[serde(rename = "type")]
     pub redirect_type: u16,
@@ -459,8 +470,16 @@ pub struct KvRecord {
 }
 
 impl KvRecord {
+    pub fn gone() -> Self {
+        KvRecord {
+            gone: true,
+            ..Default::default()
+        }
+    }
+
     pub fn from_link(l: &Link) -> Self {
         KvRecord {
+            gone: false,
             id: l.id,
             url: apply_utm(&l.url, &l.utm),
             redirect_type: l.redirect_type,
@@ -535,6 +554,14 @@ mod tests {
     }
 
     #[test]
+    fn gone_record_round_trips_and_old_records_are_live() {
+        let json = serde_json::to_string(&KvRecord::gone()).unwrap();
+        assert!(serde_json::from_str::<KvRecord>(&json).unwrap().gone);
+        let old = r#"{"id":3,"url":"https://e.com","type":302,"passthrough":true}"#;
+        assert!(!serde_json::from_str::<KvRecord>(old).unwrap().gone);
+    }
+
+    #[test]
     fn destination_rules() {
         let mut r = KvRecord {
             id: 1,
@@ -551,6 +578,7 @@ mod tests {
                 ..Default::default()
             },
             passthrough: false,
+            gone: false,
         };
         assert_eq!(r.destination("iOS", "mobile", Some("RO")), "https://ios");
         assert_eq!(r.destination("Android", "mobile", Some("RO")), "https://ro");

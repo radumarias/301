@@ -12,8 +12,9 @@ Docs: [Requirements](https://claude.ai/artifact/Vjvrkrzm6cYzkx13JHaWG8) · [Tech
 
 | Area | What you get |
 | --- | --- |
-| Slugs | Custom (case-sensitive, `/` allowed) or generated: random chars (`k7RmQ2x`), words (`brave-otter-42`), names (`curious-lovelace`) |
+| Slugs | Custom (case-sensitive, `/` allowed; a new slug that differs from an existing one only in letter case is refused) or generated: random chars (`k7RmQ2x`), words (`brave-otter-42`), names (`curious-lovelace`) |
 | Redirects | 301 / 302 / 307 / 308 per link, query-string passthrough, `slug+` preview page, renamed slugs keep working as aliases |
+| Hijack-proof slugs | A slug that was ever used is never given to another link: deleting a link (or removing an alias) retires its slug for good, enforced by D1 triggers. Retired slugs answer 410, match case-insensitively (`Promo` blocks `promo`), and can't be overwritten by imports. Only the admin who created a link can restore it, with its original destination (see *Retired* in the admin) |
 | Rules | Expiry by date or max clicks with fallback URL, password protection (PBKDF2), country and device (iOS / Android / desktop) targeting |
 | Marketing | UTM builder with live preview, tags, notes, QR codes (SVG/PNG, colours, error correction, scans counted separately) |
 | Analytics | Clicks over time, countries, cities, referrers, devices, OS, browsers; bots and link-preview crawlers counted separately; no IPs stored |

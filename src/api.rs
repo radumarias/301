@@ -17,6 +17,7 @@ fn store_err(e: StoreError) -> Result<Response> {
         StoreError::Bad(_) => 400,
         StoreError::NotFound => 404,
         StoreError::Conflict(_) => 409,
+        StoreError::Forbidden(_) => 403,
         StoreError::Internal(_) => 500,
     };
     json_error(e.public_message(), status)
@@ -99,7 +100,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["links"], _) => list_links(&env, &query).await,
         (Method::Post, ["links"], _) => {
             let input: LinkInput = body!(req);
-            respond(store::create_link(&env, &input).await, 201)
+            respond(store::create_link(&env, &input, &who.email).await, 201)
         }
         (Method::Post, ["links", "bulk"], _) => {
             let b: Bulk = body!(req);
@@ -158,12 +159,28 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["slug", "check"], _) => {
             let slug = q("slug").unwrap_or_default();
             let valid = crate::slug::validate(slug);
-            let taken = store::slug_owner(&env, slug).await?;
+            // `for` is the link being edited: its own slugs (live or retired) are free to it.
+            let owner = q("for").and_then(|v| v.parse::<i64>().ok());
+            let held = store::slug_held(&env, slug, owner, true).await?;
+            let (taken_by, retired_by) = match held {
+                Some(store::Held::Live(id)) => (Some(id), None),
+                Some(store::Held::Retired(id)) => (None, Some(id)),
+                None => (None, None),
+            };
             json(
-                &serde_json::json!({ "valid": valid.is_ok(), "reason": valid.err(), "taken_by": taken }),
+                &serde_json::json!({ "valid": valid.is_ok(), "reason": valid.err(), "taken_by": taken_by, "retired_by": retired_by }),
                 200,
             )
         }
+        (Method::Get, ["retired"], _) => {
+            let (limit, offset) = page_params(&query, 100);
+            let (items, total) = store::list_retired(&env, q("q"), limit, offset).await?;
+            json(&Page { items, total }, 200)
+        }
+        (Method::Post, ["retired", id, "restore"], _) => match id.parse::<i64>() {
+            Ok(id) => respond(store::restore_link(&env, id, &who.email).await, 200),
+            Err(_) => json_error("bad id", 400),
+        },
         (Method::Get, ["stats"], _) => stats(&env, None, q("range").unwrap_or("30d")).await,
         (Method::Get, ["tags"], _) => tags(&env).await,
         (Method::Get, ["settings"], _) => json(&store::settings(&env).await?, 200),
@@ -180,7 +197,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         }
         (Method::Post, ["import", "commit"], _) => {
             let b: import::CommitRequest = body!(req);
-            respond(import::commit(&env, b).await, 200)
+            respond(import::commit(&env, b, &who.email).await, 200)
         }
         (Method::Get, ["export"], _) => export(&env, q("format").unwrap_or("csv")).await,
         (Method::Post, ["maintenance", "rebuild-kv"], _) => {
@@ -191,6 +208,15 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
 }
 
 // ---- Listing ----
+
+/// `limit` (1..=500, default `default_limit`) and `offset` (>= 0) from the query string.
+fn page_params(q: &HashMap<String, String>, default_limit: i64) -> (i64, i64) {
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    (
+        num("limit").unwrap_or(default_limit).clamp(1, 500),
+        num("offset").unwrap_or(0).max(0),
+    )
+}
 
 #[derive(Serialize)]
 struct Page<T> {
@@ -243,16 +269,7 @@ async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> 
     } else {
         "DESC"
     };
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(50)
-        .clamp(1, 500);
-    let offset = q
-        .get("offset")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
-        .max(0);
+    let (limit, offset) = page_params(q, 50);
 
     let d = store::db(env)?;
     let res = d

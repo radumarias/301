@@ -1,7 +1,7 @@
 //! Persistence: D1 is the source of truth, KV is a read-through cache for redirects.
 //!
 //! Every link mutation goes through this module, which keeps KV in sync in one place
-//! (`sync_kv` / `forget_kv`).
+//! (`sync_kv` / `retire_kv`).
 
 use crate::model::{validate_redirect_type, validate_url, KvRecord, Link, LinkInput, LinkRow};
 use crate::slug::{self, Style};
@@ -14,13 +14,14 @@ use worker::{D1Database, D1PreparedStatement, Env, KvStore};
 
 pub const KV_CACHE_TTL: u64 = 60;
 
-pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, clicks, last_click_at, created_at, updated_at";
+pub const LINK_COLS: &str = "id, slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, created_by, clicks, last_click_at, created_at, updated_at";
 
 #[derive(Debug)]
 pub enum StoreError {
     Bad(String),
     NotFound,
     Conflict(String),
+    Forbidden(String),
     Internal(worker::Error),
 }
 
@@ -28,7 +29,7 @@ impl StoreError {
     /// Message safe to show to the admin (internal details are logged, not returned).
     pub fn public_message(&self) -> String {
         match self {
-            StoreError::Bad(m) | StoreError::Conflict(m) => m.clone(),
+            StoreError::Bad(m) | StoreError::Conflict(m) | StoreError::Forbidden(m) => m.clone(),
             StoreError::NotFound => "not found".into(),
             StoreError::Internal(e) => {
                 worker::console_error!("internal: {e}");
@@ -38,11 +39,22 @@ impl StoreError {
     }
 }
 
+/// Message of the D1 triggers in migrations/0002 that guard retired slugs.
+const RETIRED_TRIGGER_MSG: &str = "slug is permanently retired";
+
 impl From<worker::Error> for StoreError {
     fn from(e: worker::Error) -> Self {
+        // A write that lost a race to the database's own retired-slug guard.
+        if e.to_string().contains(RETIRED_TRIGGER_MSG) {
+            return StoreError::Conflict(RETIRED_MSG.into());
+        }
         StoreError::Internal(e)
     }
 }
+
+/// What the admin sees when a slug is refused because it was used before.
+pub const RETIRED_MSG: &str = "this slug was used before (by a deleted link or a removed alias) and is \
+     permanently retired: it can never point anywhere else (restore the deleted link to use it again)";
 
 impl From<worker::kv::KvError> for StoreError {
     fn from(e: worker::kv::KvError) -> Self {
@@ -272,31 +284,68 @@ pub async fn get_link(env: &Env, id: i64) -> worker::Result<Option<Link>> {
     Ok(with_aliases(env, links).await?.pop())
 }
 
-/// Finds a link by its slug or one of its aliases (aliases included).
-pub async fn get_link_by_slug(env: &Env, slug: &str) -> worker::Result<Option<Link>> {
-    let links = query_links(
-        env,
-        "WHERE slug = ?1 OR id = (SELECT link_id FROM aliases WHERE slug = ?1) LIMIT 1",
-        &[s(slug)],
-    )
-    .await?;
-    Ok(with_aliases(env, links).await?.pop())
+/// Why a slug cannot be given to a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// A live link (by its slug or an alias) uses it.
+    Live(i64),
+    /// It belonged to a link that was deleted (or to a removed alias) and stays bound to
+    /// that link id forever, so old copies of the short URL can never be hijacked.
+    Retired(i64),
 }
 
-/// Who owns a slug: Some(link_id) when taken (as slug or alias).
-pub async fn slug_owner(env: &Env, slug: &str) -> worker::Result<Option<i64>> {
+/// The first hold on a slug by a link other than `owner` (live holds first).
+///
+/// Retired slugs always compare case-insensitively ("Promo" retired blocks "promo").
+/// Live slugs do too when `live_nocase` is set (manual and generated slugs, so nobody
+/// creates a look-alike of an existing link); imports keep exact matching, because the
+/// services they come from have case-sensitive slugs that must survive the move.
+pub async fn slug_held(
+    env: &Env,
+    slug: &str,
+    owner: Option<i64>,
+    live_nocase: bool,
+) -> worker::Result<Option<Held>> {
+    #[derive(Deserialize)]
+    struct Row {
+        id: i64,
+        retired: i64,
+    }
+    let live = if live_nocase {
+        "= ?1 COLLATE NOCASE"
+    } else {
+        "= ?1"
+    };
     let row = db(env)?
-        .prepare("SELECT id FROM links WHERE slug = ?1 UNION ALL SELECT link_id AS id FROM aliases WHERE slug = ?1 LIMIT 1")
-        .bind(&[s(slug)])?
-        .first::<IdRow>(None)
+        .prepare(format!(
+            "SELECT id, 0 AS retired FROM links WHERE slug {live} AND id IS NOT ?2 \
+             UNION ALL SELECT link_id, 0 FROM aliases WHERE slug {live} AND link_id IS NOT ?2 \
+             UNION ALL SELECT link_id, 1 FROM retired_slugs WHERE slug = ?1 COLLATE NOCASE AND link_id IS NOT ?2 \
+             ORDER BY retired LIMIT 1"
+        ))
+        .bind(&[s(slug), on(owner)])?
+        .first::<Row>(None)
         .await?;
-    Ok(row.map(|r| r.id))
+    Ok(row.map(|r| {
+        if r.retired == 0 {
+            Held::Live(r.id)
+        } else {
+            Held::Retired(r.id)
+        }
+    }))
+}
+
+pub fn held_error(sl: &str, held: Held) -> StoreError {
+    match held {
+        Held::Live(_) => StoreError::Conflict(format!("slug '{sl}' is already taken")),
+        Held::Retired(_) => StoreError::Conflict(format!("slug '{sl}': {RETIRED_MSG}")),
+    }
 }
 
 pub async fn unique_slug(env: &Env, style: Style, length: usize) -> SResult<String> {
     for attempt in 0..12 {
         let candidate = slug::generate(style, length, attempt);
-        if slug_owner(env, &candidate).await?.is_none() {
+        if slug_held(env, &candidate, None, true).await?.is_none() {
             return Ok(candidate);
         }
     }
@@ -305,15 +354,14 @@ pub async fn unique_slug(env: &Env, style: Style, length: usize) -> SResult<Stri
     ))
 }
 
-/// Validates a requested slug and checks it is free (or already owned by `owner`).
+/// Validates a requested slug and checks it is free (or already held by `owner`, which
+/// includes `owner`'s own retired slugs, such as an alias it had before).
 pub async fn claim_slug(env: &Env, requested: &str, owner: Option<i64>) -> SResult<String> {
     let sl = slug::normalize(requested).ok_or_else(|| StoreError::Bad("slug is empty".into()))?;
     slug::validate(&sl).map_err(StoreError::Bad)?;
-    match slug_owner(env, &sl).await? {
-        Some(o) if Some(o) != owner => Err(StoreError::Conflict(format!(
-            "slug '{sl}' is already taken"
-        ))),
-        _ => Ok(sl),
+    match slug_held(env, &sl, owner, true).await? {
+        Some(h) => Err(held_error(&sl, h)),
+        None => Ok(sl),
     }
 }
 
@@ -364,9 +412,10 @@ fn link_binds(l: &Link) -> Vec<JsValue> {
 pub fn insert_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatement> {
     let mut binds = link_binds(l);
     binds.push(n(l.created_at));
+    binds.push(os(&l.created_by));
     db.prepare(
-        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) RETURNING id",
+        "INSERT INTO links (slug, url, title, notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, utm, geo, device, source, updated_at, created_at, created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) RETURNING id",
     )
     .bind(&binds)
 }
@@ -383,8 +432,15 @@ pub fn update_stmt(db: &D1Database, l: &Link) -> worker::Result<D1PreparedStatem
 }
 
 /// Builds a new (unsaved) link from an input, with defaults from settings.
-pub async fn new_link(env: &Env, st: &Settings, input: &LinkInput, source: &str) -> SResult<Link> {
+pub async fn new_link(
+    env: &Env,
+    st: &Settings,
+    input: &LinkInput,
+    source: &str,
+    created_by: &str,
+) -> SResult<Link> {
     let mut link = Link::new(st.default_redirect, source);
+    link.created_by = Some(created_by.to_string());
     input.apply(&mut link).map_err(StoreError::Bad)?;
     apply_password(&mut link, input).await?;
     link.slug = match input.slug.as_deref().and_then(slug::normalize) {
@@ -404,9 +460,9 @@ pub async fn new_link(env: &Env, st: &Settings, input: &LinkInput, source: &str)
     Ok(link)
 }
 
-pub async fn create_link(env: &Env, input: &LinkInput) -> SResult<Link> {
+pub async fn create_link(env: &Env, input: &LinkInput, created_by: &str) -> SResult<Link> {
     let st = settings(env).await.unwrap_or_default();
-    let mut link = new_link(env, &st, input, "manual").await?;
+    let mut link = new_link(env, &st, input, "manual", created_by).await?;
     let row = insert_stmt(&db(env)?, &link)?.first::<IdRow>(None).await?;
     link.id = row
         .ok_or_else(|| {
@@ -478,10 +534,12 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
     for chunk in links.chunks(90) {
         let marks = vec!["?"; chunk.len()].join(",");
         let ids: Vec<JsValue> = chunk.iter().map(|l| n(l.id)).collect();
+        // Links before aliases: the alias tombstone trigger reads "link already gone" as
+        // "deleted with the link" (a restore brings those aliases back).
         for table in [
             "clicks WHERE link_id",
-            "aliases WHERE link_id",
             "links WHERE id",
+            "aliases WHERE link_id",
         ] {
             stmts.push(
                 d.prepare(format!("DELETE FROM {table} IN ({marks})"))
@@ -494,7 +552,7 @@ pub async fn delete_links(env: &Env, links: &[Link]) -> SResult<()> {
         .iter()
         .flat_map(|l| std::iter::once(l.slug.as_str()).chain(l.aliases.iter().map(String::as_str)))
         .collect();
-    forget_kv(env, &slugs).await
+    retire_kv(env, &slugs).await
 }
 
 pub async fn delete_link(env: &Env, id: i64) -> SResult<()> {
@@ -511,7 +569,152 @@ pub async fn delete_alias(env: &Env, id: i64, alias: &str) -> SResult<()> {
     if res.meta()?.and_then(|m| m.changes).unwrap_or(0) == 0 {
         return Err(StoreError::NotFound);
     }
-    forget_kv(env, &[alias]).await
+    retire_kv(env, &[alias]).await
+}
+
+// ---- Retired slugs (see migrations/0002_retired_slugs.sql) ----
+
+/// A retired slug; alias rows show their link's destination from its primary row.
+#[derive(Serialize, Debug)]
+pub struct Retired {
+    pub slug: String,
+    pub link_id: i64,
+    pub was_alias: bool,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub created_by: Option<String>,
+    pub retired_at: i64,
+}
+
+#[derive(Deserialize)]
+struct RetiredRow {
+    slug: String,
+    link_id: i64,
+    was_alias: i64,
+    url: Option<String>,
+    title: Option<String>,
+    created_by: Option<String>,
+    retired_at: i64,
+}
+
+impl From<RetiredRow> for Retired {
+    fn from(r: RetiredRow) -> Self {
+        Retired {
+            slug: r.slug,
+            link_id: r.link_id,
+            was_alias: r.was_alias != 0,
+            url: r.url,
+            title: r.title,
+            created_by: r.created_by,
+            retired_at: r.retired_at,
+        }
+    }
+}
+
+/// Retired slugs of deleted links, newest first, optionally filtered by slug or URL.
+pub async fn list_retired(
+    env: &Env,
+    q: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> worker::Result<(Vec<Retired>, i64)> {
+    let mut wh = "r.link_id NOT IN (SELECT id FROM links)".to_string();
+    let mut binds = vec![];
+    if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
+        binds.push(s(&format!("%{q}%")));
+        wh.push_str(" AND (r.slug LIKE ?1 OR p.url LIKE ?1)");
+    }
+    let from = format!(
+        "FROM retired_slugs r LEFT JOIN retired_slugs p ON p.link_id = r.link_id AND p.was_alias = 0 WHERE {wh}"
+    );
+    let d = db(env)?;
+    let count = d
+        .prepare(format!("SELECT COUNT(*) AS n {from}"))
+        .bind(&binds)?;
+    let i = binds.len();
+    binds.push(n(limit));
+    binds.push(n(offset));
+    let page = d
+        .prepare(format!(
+            "SELECT r.slug, r.link_id, r.was_alias, p.url, p.title, p.created_by, r.retired_at {from} \
+             ORDER BY r.retired_at DESC, r.link_id DESC, r.was_alias, r.slug LIMIT ?{} OFFSET ?{}",
+            i + 1,
+            i + 2
+        ))
+        .bind(&binds)?;
+    let res = d.batch(vec![count, page]).await?;
+    let total = res[0]
+        .results::<CountRow>()?
+        .first()
+        .map(|r| r.n)
+        .unwrap_or(0);
+    let rows = res[1].results::<RetiredRow>()?;
+    Ok((rows.into_iter().map(Retired::from).collect(), total))
+}
+
+/// Rebuilds a deleted link from its primary tombstone. Every `links` column except the
+/// click counters must appear here and in the snapshot of the `retire_link_slug` trigger
+/// (a unit test checks both against `LINK_COLS`). A no-op when the link is already live,
+/// so a second, racing restore succeeds instead of failing on the `links.id` key.
+const RESTORE_LINK_SQL: &str = "INSERT INTO links (id, slug, url, title, created_by, created_at, updated_at, \
+     notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, \
+     utm, geo, device, source, clicks, last_click_at) \
+     SELECT link_id, slug, url, title, created_by, COALESCE(created_at, ?2), ?2, \
+     json_extract(snapshot, '$.notes'), COALESCE(json_extract(snapshot, '$.tags'), '[]'), \
+     COALESCE(json_extract(snapshot, '$.redirect_type'), 302), COALESCE(json_extract(snapshot, '$.disabled'), 0), \
+     json_extract(snapshot, '$.expires_at'), json_extract(snapshot, '$.max_clicks'), \
+     json_extract(snapshot, '$.fallback_url'), json_extract(snapshot, '$.password_hash'), \
+     COALESCE(json_extract(snapshot, '$.passthrough'), 1), json_extract(snapshot, '$.utm'), \
+     json_extract(snapshot, '$.geo'), json_extract(snapshot, '$.device'), \
+     COALESCE(json_extract(snapshot, '$.source'), 'manual'), COALESCE(json_extract(snapshot, '$.clicks'), 0), \
+     json_extract(snapshot, '$.last_click_at') \
+     FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0 \
+     AND NOT EXISTS (SELECT 1 FROM links WHERE id = ?1) ORDER BY retired_at DESC LIMIT 1";
+
+/// Aliases that went away with the link come back, unless their slug is live again
+/// (removed-on-their-own aliases stay removed; other links' slugs are guarded by triggers).
+const RESTORE_ALIASES_SQL: &str = "INSERT OR IGNORE INTO aliases (slug, link_id) \
+     SELECT slug, link_id FROM retired_slugs r WHERE link_id = ?1 AND was_alias = 1 AND with_link = 1 \
+     AND NOT EXISTS (SELECT 1 FROM links WHERE slug = r.slug)";
+
+/// Brings a deleted link back under its original id, slug, aliases, destination and
+/// settings (the click total is kept, click details are not). Only the admin who created it may do this; links
+/// created before creators were recorded can be restored by any admin, since the
+/// destination is the original one either way.
+pub async fn restore_link(env: &Env, id: i64, who: &str) -> SResult<Link> {
+    #[derive(Deserialize)]
+    struct Row {
+        created_by: Option<String>,
+        live: i64,
+    }
+    let d = db(env)?;
+    let row = d
+        .prepare(
+            "SELECT created_by, EXISTS (SELECT 1 FROM links WHERE id = ?1) AS live \
+             FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0 ORDER BY retired_at DESC LIMIT 1",
+        )
+        .bind(&[n(id)])?
+        .first::<Row>(None)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    if row.live != 0 {
+        return Err(StoreError::Conflict("this link is not deleted".into()));
+    }
+    if let Some(owner) = &row.created_by {
+        if !owner.eq_ignore_ascii_case(who) {
+            return Err(StoreError::Forbidden(format!(
+                "only {owner}, who created this link, can restore it"
+            )));
+        }
+    }
+    d.batch(vec![
+        d.prepare(RESTORE_LINK_SQL).bind(&[n(id), n(now_ms())])?,
+        d.prepare(RESTORE_ALIASES_SQL).bind(&[n(id)])?,
+    ])
+    .await?;
+    let link = get_link(env, id).await?.ok_or(StoreError::NotFound)?;
+    sync_kv(env, &link).await?;
+    Ok(link.with_status())
 }
 
 // ---- KV sync (the only place KV is written for links) ----
@@ -534,18 +737,24 @@ pub async fn sync_kv(env: &Env, link: &Link) -> SResult<()> {
     Ok(())
 }
 
-/// Removes KV records so the next redirect refills them from D1.
-pub async fn forget_kv(env: &Env, slugs: &[&str]) -> SResult<()> {
+/// Replaces the KV records of retired slugs with permanent "gone" records, so the
+/// redirect path answers 410 from the edge without reading D1 (a restore overwrites them).
+pub async fn retire_kv(env: &Env, slugs: &[&str]) -> SResult<()> {
     let store = kv(env)?;
-    let keys: Vec<String> = slugs.iter().map(|s| kv_key(s)).collect();
-    for r in join_all(keys.iter().map(|k| store.delete(k))).await {
+    let rec = serde_json::to_string(&KvRecord::gone()).unwrap_or_default();
+    let mut puts = vec![];
+    for sl in slugs {
+        puts.push(store.put(&kv_key(sl), rec.clone())?.execute());
+    }
+    for r in join_all(puts).await {
         r?;
     }
     Ok(())
 }
 
-/// Redirect-path lookup: KV first; on a miss, D1. The bool says the KV record should be
-/// filled (the caller does it after responding).
+/// Redirect-path lookup: KV first; on a miss, D1 (the link and, failing that, a retired
+/// slug, in one round trip). The bool says the KV record should be filled (the caller
+/// does it after responding). A retired slug comes back as `KvRecord::gone()`.
 pub async fn lookup(env: &Env, slug: &str) -> worker::Result<Option<(KvRecord, bool)>> {
     if let Ok(Some(rec)) = kv(env)?
         .get(&kv_key(slug))
@@ -555,9 +764,21 @@ pub async fn lookup(env: &Env, slug: &str) -> worker::Result<Option<(KvRecord, b
     {
         return Ok(Some((rec, false)));
     }
-    Ok(get_link_by_slug(env, slug)
-        .await?
-        .map(|l| (KvRecord::from_link(&l), true)))
+    let d = db(env)?;
+    let res = d
+        .batch(vec![
+            d.prepare(format!(
+                "SELECT {LINK_COLS} FROM links WHERE slug = ?1 OR id = (SELECT link_id FROM aliases WHERE slug = ?1) LIMIT 1"
+            ))
+            .bind(&[s(slug)])?,
+            d.prepare("SELECT link_id AS id FROM retired_slugs WHERE slug = ?1 LIMIT 1")
+                .bind(&[s(slug)])?,
+        ])
+        .await?;
+    if let Some(row) = res[0].results::<LinkRow>()?.pop() {
+        return Ok(Some((KvRecord::from_link(&Link::from(row)), true)));
+    }
+    Ok((!res[1].results::<IdRow>()?.is_empty()).then(|| (KvRecord::gone(), true)))
 }
 
 /// Read-through fills expire: a fill racing an admin update/delete would otherwise write
@@ -654,4 +875,41 @@ pub async fn record_click(env: &Env, c: Click<'_>) -> worker::Result<()> {
     }
     d.batch(stmts).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A column added to `links` but forgotten in the restore path would silently drop
+    /// that setting (a password or an expiry) when a deleted link is restored.
+    #[test]
+    fn restore_covers_every_link_column() {
+        let migration = include_str!("../migrations/0002_retired_slugs.sql");
+        let insert_cols = RESTORE_LINK_SQL
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(cols, _)| cols)
+            .unwrap();
+        let kept = ["slug", "url", "title", "created_by", "created_at"];
+        for col in LINK_COLS.split(',').map(str::trim) {
+            if ["id", "updated_at"].contains(&col) {
+                continue;
+            }
+            assert!(
+                insert_cols.split(',').any(|c| c.trim() == col),
+                "restore INSERT misses {col}"
+            );
+            if !kept.contains(&col) {
+                assert!(
+                    RESTORE_LINK_SQL.contains(&format!("'$.{col}'")),
+                    "restore misses {col}"
+                );
+                assert!(
+                    migration.contains(&format!("'{col}', OLD.{col}")),
+                    "snapshot misses {col}"
+                );
+            }
+        }
+    }
 }

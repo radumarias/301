@@ -105,6 +105,19 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         };
     };
 
+    // A deleted link's slug is retired for good: say so (410) instead of sending the
+    // visitor to the catch-all, so old copies of the link are clearly dead, not moved.
+    if rec.gone {
+        if needs_fill {
+            let (fill_env, fill_slug, fill_rec) = (env.clone(), slug.clone(), rec.clone());
+            ctx.wait_until(async move {
+                let _ = store::fill_kv(&fill_env, &fill_slug, &fill_rec).await;
+            });
+        }
+        return pages::gone(
+            "It was deleted. Its address is permanently retired and will never point anywhere else.",
+        );
+    }
     if rec.disabled {
         return pages::gone("It was disabled by its owner.");
     }
