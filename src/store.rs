@@ -669,7 +669,7 @@ const RESTORE_LINK_SQL: &str = "INSERT INTO links (id, slug, url, title, created
      COALESCE(json_extract(snapshot, '$.source'), 'manual'), COALESCE(json_extract(snapshot, '$.clicks'), 0), \
      json_extract(snapshot, '$.last_click_at') \
      FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0 \
-     AND NOT EXISTS (SELECT 1 FROM links WHERE id = ?1)";
+     AND NOT EXISTS (SELECT 1 FROM links WHERE id = ?1) ORDER BY retired_at DESC LIMIT 1";
 
 /// Aliases that went away with the link come back, unless their slug is live again
 /// (removed-on-their-own aliases stay removed; other links' slugs are guarded by triggers).
@@ -691,7 +691,7 @@ pub async fn restore_link(env: &Env, id: i64, who: &str) -> SResult<Link> {
     let row = d
         .prepare(
             "SELECT created_by, EXISTS (SELECT 1 FROM links WHERE id = ?1) AS live \
-             FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0",
+             FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0 ORDER BY retired_at DESC LIMIT 1",
         )
         .bind(&[n(id)])?
         .first::<Row>(None)
