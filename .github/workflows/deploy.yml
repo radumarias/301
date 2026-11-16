@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "production (the live Worker) or preview (a separate Worker with its own KV, D1 and Access app, for testing a branch)"
+        type: choice
+        options: [production, preview]
+        default: production
   schedule:
     # Weekly dependency audit, so new advisories show up without a push.
     - cron: "17 6 * * 1"
@@ -70,7 +76,15 @@ jobs:
       ADMIN_SERVICE_TOKENS: ${{ vars.ADMIN_SERVICE_TOKENS }}
       ACCESS_TEAM_DOMAIN: ${{ vars.ACCESS_TEAM_DOMAIN }}
       PRIVACY_CONTACT: ${{ vars.PRIVACY_CONTACT }}
-      DOMAIN: ${{ vars.DOMAIN }}
+      # A preview gets its own Worker, KV, D1 and Access app on workers.dev; live data is
+      # never touched. Pushes to main always deploy production (inputs.target is empty).
+      PREVIEW: ${{ inputs.target == 'preview' && '1' || '' }}
+      WORKER_NAME: ${{ inputs.target == 'preview' && 'xorio-301-preview' || 'xorio-301' }}
+      KV_TITLE: ${{ inputs.target == 'preview' && 'xorio-301-preview-links' || 'xorio-301-links' }}
+      D1_NAME: ${{ inputs.target == 'preview' && 'xorio-301-preview' || 'xorio-301' }}
+      APP_NAME: ${{ inputs.target == 'preview' && '301 admin (preview)' || '301 admin' }}
+      # `cond && '' || x` would always yield x, hence the inverted form.
+      DOMAIN: ${{ inputs.target != 'preview' && vars.DOMAIN || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -85,6 +99,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Point wrangler.toml at the preview Worker
+        if: env.PREVIEW == '1'
+        run: |
+          sed -i -e "s|^name = \"xorio-301\"|name = \"$WORKER_NAME\"|" \
+                 -e "s|^database_name = \"xorio-301\"|database_name = \"$D1_NAME\"|" \
+                 -e 's|^namespace_id = "3011"|namespace_id = "3012"|' wrangler.toml
+          grep -nE '^(name|database_name|namespace_id) =' wrangler.toml
       - name: Provision KV, D1 and Cloudflare Access
         run: ./scripts/provision.sh
       - name: Apply D1 migrations
