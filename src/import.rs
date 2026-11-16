@@ -5,7 +5,7 @@
 
 use crate::model::{Link, LinkInput};
 use crate::slug;
-use crate::store::{self, s, SResult, StoreError};
+use crate::store::{self, s, Held, SResult, StoreError};
 use crate::util::now_ms;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -398,37 +398,31 @@ impl ImportRow {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Taken {
-    Live(i64),
-    Retired,
-}
-
-async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, Taken>> {
+/// Who holds each of `slugs`. Live slugs match exactly (imported services are
+/// case-sensitive); retired slugs match case-insensitively, since an import must never
+/// overwrite or re-create one. One statement per 30 slugs (90 binds, D1 allows 100).
+async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, Held>> {
     #[derive(Deserialize)]
     struct Row {
         slug: String,
         id: i64,
-        retired: Option<i64>,
+        retired: i64,
     }
     let d = store::db(env)?;
     let mut stmts = vec![];
-    // Live slugs match exactly (imported services are case-sensitive). Retired slugs
-    // match case-insensitively and can never be overwritten or re-created by an import.
     for chunk in slugs.chunks(30) {
         let marks = vec!["?"; chunk.len()].join(",");
-        let binds: Vec<_> = chunk.iter().chain(chunk).map(|c| s(c)).collect();
+        let binds: Vec<_> = chunk
+            .iter()
+            .chain(chunk)
+            .chain(chunk)
+            .map(|c| s(c))
+            .collect();
         stmts.push(
             d.prepare(format!(
-                "SELECT slug, id FROM links WHERE slug IN ({marks}) UNION ALL SELECT slug, link_id AS id FROM aliases WHERE slug IN ({marks})"
-            ))
-            .bind(&binds)?,
-        );
-        let ors = vec!["slug = ? COLLATE NOCASE"; chunk.len()].join(" OR ");
-        let binds: Vec<_> = chunk.iter().map(|c| s(c)).collect();
-        stmts.push(
-            d.prepare(format!(
-                "SELECT slug, link_id AS id, 1 AS retired FROM retired_slugs WHERE {ors}"
+                "SELECT slug, id, 0 AS retired FROM links WHERE slug IN ({marks}) \
+                 UNION ALL SELECT slug, link_id, 0 FROM aliases WHERE slug IN ({marks}) \
+                 UNION ALL SELECT slug, link_id, 1 FROM retired_slugs WHERE slug COLLATE NOCASE IN ({marks})"
             ))
             .bind(&binds)?,
         );
@@ -437,20 +431,19 @@ async fn taken(env: &Env, slugs: &[String]) -> SResult<HashMap<String, Taken>> {
     if stmts.is_empty() {
         return Ok(out);
     }
-    let mut retired: Vec<String> = vec![];
+    let mut retired: HashMap<String, i64> = HashMap::new();
     for res in d.batch(stmts).await? {
         for r in res.results::<Row>()? {
-            if r.retired.unwrap_or(0) != 0 {
-                retired.push(r.slug.to_lowercase());
+            if r.retired != 0 {
+                retired.insert(r.slug.to_lowercase(), r.id);
             } else {
-                out.insert(r.slug, Taken::Live(r.id));
+                out.insert(r.slug, Held::Live(r.id));
             }
         }
     }
-    // Map each requested slug that matches a retired one (any case) to Retired.
     for sl in slugs {
-        if !out.contains_key(sl) && retired.contains(&sl.to_lowercase()) {
-            out.insert(sl.clone(), Taken::Retired);
+        if let Some(&id) = retired.get(&sl.to_lowercase()) {
+            out.entry(sl.clone()).or_insert(Held::Retired(id));
         }
     }
     Ok(out)
@@ -535,13 +528,13 @@ pub async fn commit(env: &Env, req: CommitRequest, created_by: &str) -> SResult<
                 }
                 // A retired slug is never overwritten: that would be exactly the hijack
                 // the tombstone exists to prevent.
-                "overwrite" if conflict == Some(Taken::Retired) => {
+                "overwrite" if matches!(conflict, Some(Held::Retired(_))) => {
                     fail(Some(&slug_v), store::RETIRED_MSG.into());
                     continue;
                 }
                 "overwrite" if !dup => {
                     // Same write path as an edit in the admin UI.
-                    let Some(Taken::Live(id)) = conflict else {
+                    let Some(Held::Live(id)) = conflict else {
                         continue;
                     };
                     let Some(mut link) = store::get_link(env, id).await? else {

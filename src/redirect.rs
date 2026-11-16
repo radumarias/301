@@ -98,13 +98,6 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
     };
 
     let Some((rec, needs_fill)) = store::lookup(&env, &slug).await? else {
-        // A deleted link's slug is retired for good: say so (410) instead of sending the
-        // visitor to the catch-all, so old copies of the link are clearly dead, not moved.
-        if store::is_retired(&env, &slug).await.unwrap_or(false) {
-            return pages::gone(
-                "It was deleted. Its address is permanently retired and will never point anywhere else.",
-            );
-        }
         let st = store::settings_cached(&env).await;
         return match st.not_found_url {
             Some(u) => util::redirect(&u, 302),
@@ -112,6 +105,20 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
         };
     };
 
+    // A deleted link's slug is retired for good: say so (410) instead of sending the
+    // visitor to the catch-all, so old copies of the link are clearly dead, not moved.
+    if rec.gone {
+        if needs_fill {
+            let (fill_env, fill_slug) = (env.clone(), slug.clone());
+            ctx.wait_until(async move {
+                let _ =
+                    store::fill_kv(&fill_env, &fill_slug, &crate::model::KvRecord::gone()).await;
+            });
+        }
+        return pages::gone(
+            "It was deleted. Its address is permanently retired and will never point anywhere else.",
+        );
+    }
     if rec.disabled {
         return pages::gone("It was disabled by its owner.");
     }

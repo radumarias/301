@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS retired_slugs (
   slug       TEXT PRIMARY KEY,
   link_id    INTEGER NOT NULL,
   was_alias  INTEGER NOT NULL DEFAULT 0,
+  -- 1 when the slug went away together with its link (so a restore brings it back);
+  -- 0 for an alias removed on its own, which stays removed.
+  with_link  INTEGER NOT NULL DEFAULT 1,
+  -- Primary rows only (alias rows read them from their link's primary row):
   url        TEXT,
   title      TEXT,
   created_by TEXT,
@@ -28,12 +32,13 @@ CREATE TABLE IF NOT EXISTS retired_slugs (
   retired_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS retired_slugs_nocase ON retired_slugs(slug COLLATE NOCASE);
-CREATE INDEX IF NOT EXISTS retired_slugs_link ON retired_slugs(link_id);
+CREATE INDEX IF NOT EXISTS retired_slugs_link ON retired_slugs(link_id, was_alias);
+CREATE INDEX IF NOT EXISTS retired_slugs_recent ON retired_slugs(retired_at DESC, link_id DESC, was_alias, slug);
 CREATE INDEX IF NOT EXISTS links_slug_nocase ON links(slug COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS aliases_slug_nocase ON aliases(slug COLLATE NOCASE);
 
--- Tombstones. Aliases are deleted before their link (store::delete_links), so the link
--- row is still there to copy from; if it is not (a cascade), the alias is still retired.
+-- Tombstones. store::delete_links deletes the link row first, so an alias whose link is
+-- already gone was deleted with it (with_link = 1); otherwise it was removed on its own.
 CREATE TRIGGER IF NOT EXISTS retire_link_slug AFTER DELETE ON links
 BEGIN
   INSERT INTO retired_slugs (slug, link_id, was_alias, url, title, created_by, created_at, snapshot, retired_at)
@@ -45,7 +50,7 @@ BEGIN
                       'device', OLD.device, 'source', OLD.source),
           CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
   ON CONFLICT(slug) DO UPDATE SET
-    was_alias = excluded.was_alias, url = excluded.url, title = excluded.title,
+    was_alias = 0, with_link = 1, url = excluded.url, title = excluded.title,
     created_by = excluded.created_by, created_at = excluded.created_at,
     snapshot = excluded.snapshot, retired_at = excluded.retired_at
   WHERE link_id = excluded.link_id;
@@ -53,18 +58,13 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS retire_alias AFTER DELETE ON aliases
 BEGIN
-  INSERT INTO retired_slugs (slug, link_id, was_alias, url, title, created_by, created_at, snapshot, retired_at)
+  INSERT INTO retired_slugs (slug, link_id, was_alias, with_link, retired_at)
   VALUES (OLD.slug, OLD.link_id, 1,
-          (SELECT url FROM links WHERE id = OLD.link_id),
-          (SELECT title FROM links WHERE id = OLD.link_id),
-          (SELECT created_by FROM links WHERE id = OLD.link_id),
-          (SELECT created_at FROM links WHERE id = OLD.link_id),
-          NULL,
+          NOT EXISTS (SELECT 1 FROM links WHERE id = OLD.link_id),
           CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
   ON CONFLICT(slug) DO UPDATE SET
-    was_alias = excluded.was_alias, url = excluded.url, title = excluded.title,
-    created_by = excluded.created_by, created_at = excluded.created_at,
-    snapshot = excluded.snapshot, retired_at = excluded.retired_at
+    was_alias = 1, with_link = excluded.with_link, url = NULL, title = NULL, created_by = NULL,
+    created_at = NULL, snapshot = NULL, retired_at = excluded.retired_at
   WHERE link_id = excluded.link_id;
 END;
 
@@ -94,7 +94,7 @@ BEGIN
   SELECT RAISE(ABORT, 'slug is permanently retired');
 END;
 
-CREATE TRIGGER IF NOT EXISTS aliases_update_not_retired BEFORE UPDATE ON aliases
+CREATE TRIGGER IF NOT EXISTS aliases_update_not_retired BEFORE UPDATE OF slug, link_id ON aliases
 WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE slug = NEW.slug COLLATE NOCASE AND link_id IS NOT NEW.link_id)
 BEGIN
   SELECT RAISE(ABORT, 'slug is permanently retired');

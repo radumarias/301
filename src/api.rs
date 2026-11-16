@@ -173,14 +173,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             )
         }
         (Method::Get, ["retired"], _) => {
-            let limit = q("limit")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(100)
-                .clamp(1, 500);
-            let offset = q("offset")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0)
-                .max(0);
+            let (limit, offset) = page_params(&query, 100);
             let (items, total) = store::list_retired(&env, q("q"), limit, offset).await?;
             json(&Page { items, total }, 200)
         }
@@ -215,6 +208,15 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
 }
 
 // ---- Listing ----
+
+/// `limit` (1..=500, default `default_limit`) and `offset` (>= 0) from the query string.
+fn page_params(q: &HashMap<String, String>, default_limit: i64) -> (i64, i64) {
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    (
+        num("limit").unwrap_or(default_limit).clamp(1, 500),
+        num("offset").unwrap_or(0).max(0),
+    )
+}
 
 #[derive(Serialize)]
 struct Page<T> {
@@ -267,16 +269,7 @@ async fn list_links(env: &Env, q: &HashMap<String, String>) -> Result<Response> 
     } else {
         "DESC"
     };
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(50)
-        .clamp(1, 500);
-    let offset = q
-        .get("offset")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
-        .max(0);
+    let (limit, offset) = page_params(q, 50);
 
     let d = store::db(env)?;
     let res = d
