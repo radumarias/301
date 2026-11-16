@@ -37,6 +37,16 @@ CREATE INDEX IF NOT EXISTS retired_slugs_recent ON retired_slugs(retired_at DESC
 CREATE INDEX IF NOT EXISTS links_slug_nocase ON links(slug COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS aliases_slug_nocase ON aliases(slug COLLATE NOCASE);
 
+-- Slugs that already had a letter-case twin before this migration ("Promo" and "promo"
+-- on two links). They keep exact-case matching against tombstones, so retiring one twin
+-- never blocks renaming or restoring the other; every other slug matches case-insensitively.
+CREATE TABLE IF NOT EXISTS case_twin_slugs (slug TEXT PRIMARY KEY);
+INSERT OR IGNORE INTO case_twin_slugs
+  SELECT slug FROM (SELECT slug FROM links UNION SELECT slug FROM aliases)
+  WHERE lower(slug) IN (
+    SELECT lower(slug) FROM (SELECT slug FROM links UNION SELECT slug FROM aliases)
+    GROUP BY lower(slug) HAVING COUNT(*) > 1);
+
 -- Tombstones. store::delete_links deletes the link row first, so an alias whose link is
 -- already gone was deleted with it (with_link = 1); otherwise it was removed on its own.
 CREATE TRIGGER IF NOT EXISTS retire_link_slug AFTER DELETE ON links
@@ -47,7 +57,8 @@ BEGIN
                       'disabled', OLD.disabled, 'expires_at', OLD.expires_at, 'max_clicks', OLD.max_clicks,
                       'fallback_url', OLD.fallback_url, 'password_hash', OLD.password_hash,
                       'passthrough', OLD.passthrough, 'utm', OLD.utm, 'geo', OLD.geo,
-                      'device', OLD.device, 'source', OLD.source),
+                      'device', OLD.device, 'source', OLD.source, 'clicks', OLD.clicks,
+                      'last_click_at', OLD.last_click_at),
           CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
   ON CONFLICT(slug) DO UPDATE SET
     was_alias = 0, with_link = 1, url = excluded.url, title = excluded.title,
@@ -70,14 +81,16 @@ END;
 
 -- Guards. `IS NOT` (not `<>`) so a NULL/auto-assigned NEW.id still counts as "another link".
 CREATE TRIGGER IF NOT EXISTS links_insert_not_retired BEFORE INSERT ON links
-WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE slug = NEW.slug COLLATE NOCASE AND link_id IS NOT NEW.id)
+WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE link_id IS NOT NEW.id AND (slug = NEW.slug OR
+  (slug = NEW.slug COLLATE NOCASE AND NEW.slug NOT IN (SELECT slug FROM case_twin_slugs))))
 BEGIN
   SELECT RAISE(ABORT, 'slug is permanently retired');
 END;
 
 CREATE TRIGGER IF NOT EXISTS links_rename_not_retired BEFORE UPDATE OF slug ON links
 WHEN NEW.slug IS NOT OLD.slug
- AND EXISTS (SELECT 1 FROM retired_slugs WHERE slug = NEW.slug COLLATE NOCASE AND link_id IS NOT NEW.id)
+ AND EXISTS (SELECT 1 FROM retired_slugs WHERE link_id IS NOT NEW.id AND (slug = NEW.slug OR
+  (slug = NEW.slug COLLATE NOCASE AND NEW.slug NOT IN (SELECT slug FROM case_twin_slugs))))
 BEGIN
   SELECT RAISE(ABORT, 'slug is permanently retired');
 END;
@@ -89,13 +102,15 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS aliases_insert_not_retired BEFORE INSERT ON aliases
-WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE slug = NEW.slug COLLATE NOCASE AND link_id IS NOT NEW.link_id)
+WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE link_id IS NOT NEW.link_id AND (slug = NEW.slug OR
+  (slug = NEW.slug COLLATE NOCASE AND NEW.slug NOT IN (SELECT slug FROM case_twin_slugs))))
 BEGIN
   SELECT RAISE(ABORT, 'slug is permanently retired');
 END;
 
 CREATE TRIGGER IF NOT EXISTS aliases_update_not_retired BEFORE UPDATE OF slug, link_id ON aliases
-WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE slug = NEW.slug COLLATE NOCASE AND link_id IS NOT NEW.link_id)
+WHEN EXISTS (SELECT 1 FROM retired_slugs WHERE link_id IS NOT NEW.link_id AND (slug = NEW.slug OR
+  (slug = NEW.slug COLLATE NOCASE AND NEW.slug NOT IN (SELECT slug FROM case_twin_slugs))))
 BEGIN
   SELECT RAISE(ABORT, 'slug is permanently retired');
 END;

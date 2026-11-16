@@ -109,10 +109,9 @@ pub async fn handle(mut req: Request, env: Env, ctx: Context) -> Result<Response
     // visitor to the catch-all, so old copies of the link are clearly dead, not moved.
     if rec.gone {
         if needs_fill {
-            let (fill_env, fill_slug) = (env.clone(), slug.clone());
+            let (fill_env, fill_slug, fill_rec) = (env.clone(), slug.clone(), rec.clone());
             ctx.wait_until(async move {
-                let _ =
-                    store::fill_kv(&fill_env, &fill_slug, &crate::model::KvRecord::gone()).await;
+                let _ = store::fill_kv(&fill_env, &fill_slug, &fill_rec).await;
             });
         }
         return pages::gone(

@@ -294,7 +294,7 @@ async function retiredPage() {
   const page = await api("GET", `/retired?${qs}`);
   const search = searchBox(retiredState, retiredPage, "Search slug or URL");
   async function restore(r) {
-    if (!confirm(`Restore the deleted link /${r.slug} → ${r.url}?\n\nIt comes back with its original destination and settings (click history is not kept).`)) return;
+    if (!confirm(`Restore the deleted link /${r.slug} → ${r.url}?\n\nIt comes back with its original destination and settings and click total (click details are not kept).`)) return;
     try { const l = await api("POST", `/retired/${r.link_id}/restore`); toast("Restored"); location.hash = `#/links/${l.id}`; }
     catch (err) { toast(err.message, true); }
   }

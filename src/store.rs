@@ -654,10 +654,11 @@ pub async fn list_retired(
 
 /// Rebuilds a deleted link from its primary tombstone. Every `links` column except the
 /// click counters must appear here and in the snapshot of the `retire_link_slug` trigger
-/// (a unit test checks both against `LINK_COLS`).
+/// (a unit test checks both against `LINK_COLS`). A no-op when the link is already live,
+/// so a second, racing restore succeeds instead of failing on the `links.id` key.
 const RESTORE_LINK_SQL: &str = "INSERT INTO links (id, slug, url, title, created_by, created_at, updated_at, \
      notes, tags, redirect_type, disabled, expires_at, max_clicks, fallback_url, password_hash, passthrough, \
-     utm, geo, device, source) \
+     utm, geo, device, source, clicks, last_click_at) \
      SELECT link_id, slug, url, title, created_by, COALESCE(created_at, ?2), ?2, \
      json_extract(snapshot, '$.notes'), COALESCE(json_extract(snapshot, '$.tags'), '[]'), \
      COALESCE(json_extract(snapshot, '$.redirect_type'), 302), COALESCE(json_extract(snapshot, '$.disabled'), 0), \
@@ -665,8 +666,10 @@ const RESTORE_LINK_SQL: &str = "INSERT INTO links (id, slug, url, title, created
      json_extract(snapshot, '$.fallback_url'), json_extract(snapshot, '$.password_hash'), \
      COALESCE(json_extract(snapshot, '$.passthrough'), 1), json_extract(snapshot, '$.utm'), \
      json_extract(snapshot, '$.geo'), json_extract(snapshot, '$.device'), \
-     COALESCE(json_extract(snapshot, '$.source'), 'manual') \
-     FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0";
+     COALESCE(json_extract(snapshot, '$.source'), 'manual'), COALESCE(json_extract(snapshot, '$.clicks'), 0), \
+     json_extract(snapshot, '$.last_click_at') \
+     FROM retired_slugs WHERE link_id = ?1 AND was_alias = 0 \
+     AND NOT EXISTS (SELECT 1 FROM links WHERE id = ?1)";
 
 /// Aliases that went away with the link come back, unless their slug is live again
 /// (removed-on-their-own aliases stay removed; other links' slugs are guarded by triggers).
@@ -675,7 +678,7 @@ const RESTORE_ALIASES_SQL: &str = "INSERT OR IGNORE INTO aliases (slug, link_id)
      AND NOT EXISTS (SELECT 1 FROM links WHERE slug = r.slug)";
 
 /// Brings a deleted link back under its original id, slug, aliases, destination and
-/// settings (click history is not kept). Only the admin who created it may do this; links
+/// settings (the click total is kept, click details are not). Only the admin who created it may do this; links
 /// created before creators were recorded can be restored by any admin, since the
 /// destination is the original one either way.
 pub async fn restore_link(env: &Env, id: i64, who: &str) -> SResult<Link> {
@@ -890,7 +893,7 @@ mod tests {
             .unwrap();
         let kept = ["slug", "url", "title", "created_by", "created_at"];
         for col in LINK_COLS.split(',').map(str::trim) {
-            if ["id", "clicks", "last_click_at", "updated_at"].contains(&col) {
+            if ["id", "updated_at"].contains(&col) {
                 continue;
             }
             assert!(
